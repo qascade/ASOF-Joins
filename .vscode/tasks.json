@@ -1,0 +1,67 @@
+{
+  // Put this file in <postgres-src>/.vscode/tasks.json
+  // Run tasks with Ctrl+Shift+P -> "Tasks: Run Task".
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}",
+    "env": {
+      "POSTGRES_INSTALLDIR": "${workspaceFolder}/install",
+      "PGDATA": "${workspaceFolder}/install/data",
+      "PGPORT": "9432",
+      "PATH": "${workspaceFolder}/install/bin:${env:PATH}"
+    }
+  },
+  "tasks": [
+    {
+      "label": "pg: configure (one-time)",
+      "type": "shell",
+      "command": "./configure --prefix=\"$POSTGRES_INSTALLDIR\" --enable-debug --enable-cassert --without-icu CFLAGS='-O0 -g3'",
+      "problemMatcher": []
+    },
+    {
+      "label": "pg: initdb + createdb test (one-time)",
+      "type": "shell",
+      "command": "initdb -D \"$PGDATA\" && pg_ctl -D \"$PGDATA\" -l \"$POSTGRES_INSTALLDIR/logfile\" -w start && createdb test && pg_ctl -D \"$PGDATA\" stop -m fast",
+      "problemMatcher": []
+    },
+    {
+      "label": "pg: build",
+      "type": "shell",
+      "command": "make -j$(nproc) -s && make install -s",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "pg: start server",
+      "type": "shell",
+      "command": "pg_ctl -D \"$PGDATA\" -l \"$POSTGRES_INSTALLDIR/logfile\" -w start",
+      "problemMatcher": []
+    },
+    {
+      "label": "pg: stop server",
+      "type": "shell",
+      // '|| true' so it doesn't fail when the server isn't running
+      "command": "pg_ctl -D \"$PGDATA\" -w stop -m fast || true",
+      "problemMatcher": []
+    },
+    {
+      "label": "pg: rebuild + restart server",
+      "dependsOrder": "sequence",
+      "dependsOn": ["pg: stop server", "pg: build", "pg: start server"],
+      "problemMatcher": []
+    },
+    {
+      // Single-user mode can't run while a server owns the same data dir.
+      "label": "pg: prepare single-user",
+      "dependsOrder": "sequence",
+      "dependsOn": ["pg: stop server", "pg: build"],
+      "problemMatcher": []
+    },
+    {
+      "label": "pg: psql",
+      "type": "shell",
+      "command": "psql test",
+      "problemMatcher": []
+    }
+  ]
+}
