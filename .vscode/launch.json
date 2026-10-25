@@ -1,0 +1,41 @@
+{
+  // Put this file in <postgres-src>/.vscode/launch.json
+  // Needs the "C/C++" extension (ms-vscode.cpptools) and gdb.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // F5: stops any running server, rebuilds + installs, then runs
+      // `postgres --single` under gdb. Type SQL in the terminal, Ctrl+D to quit.
+      "name": "pg: single-user (debug)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/install/bin/postgres",
+      "args": ["--single", "-D", "${workspaceFolder}/install/data", "test"],
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        { "name": "PGDATA", "value": "${workspaceFolder}/install/data" }
+      ],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "pg: prepare single-user",
+      "setupCommands": [
+        { "text": "-enable-pretty-printing", "ignoreFailures": true },
+        { "text": "handle SIGUSR1 SIGUSR2 SIGPIPE nostop noprint pass", "ignoreFailures": true }
+      ]
+    },
+    {
+      // Server mode: start the server, open psql, run `select pg_backend_pid();`,
+      // then launch this and pick that PID.
+      "name": "pg: attach to backend",
+      "type": "cppdbg",
+      "request": "attach",
+      "program": "${workspaceFolder}/install/bin/postgres",
+      "processId": "${command:pickProcess}",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "text": "-enable-pretty-printing", "ignoreFailures": true },
+        { "text": "handle SIGUSR1 SIGUSR2 SIGPIPE nostop noprint pass", "ignoreFailures": true }
+      ]
+    }
+  ]
+}
