@@ -69,6 +69,7 @@ static TableSampleClause *transformRangeTableSample(ParseState *pstate,
 													RangeTableSample *rts);
 static ParseNamespaceItem *getNSItemForSpecialRelationTypes(ParseState *pstate,
 															RangeVar *rv);
+static JoinExpr *transformAsofToLateralJoin(ParseState *pstate, JoinExpr *j);
 static Node *transformFromClauseItem(ParseState *pstate, Node *n,
 									 ParseNamespaceItem **top_nsitem,
 									 List **namespace);
@@ -1032,6 +1033,255 @@ getNSItemForSpecialRelationTypes(ParseState *pstate, RangeVar *rv)
 }
 
 /*
+ * Context for asofRefWalker: what kinds of column references appear in
+ * one side of a candidate ASOF inequality.
+ */
+typedef struct
+{
+	const char *relname;		/* exposed name of the ASOF join's right input */
+	bool		found_col;		/* saw any ColumnRef? */
+	bool		found_rel;		/* saw a ColumnRef qualified with relname? */
+} AsofRefContext;
+
+/*
+ * Does this raw ColumnRef name a column of relation "relname"?
+ * Accepts rel.col, schema.rel.col and db.schema.rel.col (and rel.*).
+ * Unqualified references are not considered to belong to it.
+ */
+static bool
+asofColumnRefIsRel(ColumnRef *cref, const char *relname)
+{
+	int			nfields = list_length(cref->fields);
+	Node	   *qual;
+
+	if (nfields < 2)
+		return false;
+	qual = (Node *) list_nth(cref->fields, nfields - 2);
+	return IsA(qual, String) && strcmp(strVal(qual), relname) == 0;
+}
+
+static bool
+asofRefWalker(Node *node, AsofRefContext *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, ColumnRef))
+	{
+		context->found_col = true;
+		if (asofColumnRefIsRel((ColumnRef *) node, context->relname))
+			context->found_rel = true;
+		return false;
+	}
+	return raw_expression_tree_walker(node, asofRefWalker, context);
+}
+
+/*
+ * Is expr a column of the right input, written as a plain ColumnRef?
+ */
+static bool
+asofIsRightColumn(Node *expr, const char *relname)
+{
+	return expr != NULL && IsA(expr, ColumnRef) &&
+		asofColumnRefIsRel((ColumnRef *) expr, relname);
+}
+
+/*
+ * Does expr reference some column, but none of the right input's?
+ * Such an expression can only be evaluated against the left input.
+ */
+static bool
+asofIsLeftOnly(Node *expr, const char *relname)
+{
+	AsofRefContext context;
+
+	context.relname = relname;
+	context.found_col = false;
+	context.found_rel = false;
+	(void) asofRefWalker(expr, &context);
+	return context.found_col && !context.found_rel;
+}
+
+/*
+ * transformAsofToLateralJoin -
+ *	  Rewrite the raw parse tree of an ASOF join into an equivalent LATERAL
+ *	  join, before any semantic analysis is done on it.
+ *
+ *	  l ASOF JOIN r ON l.k = r.k AND l.t >= r.t
+ *
+ * becomes
+ *
+ *	  l JOIN LATERAL (SELECT * FROM r
+ *					  WHERE l.k = r.k AND l.t >= r.t
+ *					  ORDER BY r.t DESC LIMIT 1) r ON true
+ *
+ * and likewise for LEFT ASOF JOIN.  Exactly one conjunct of the ON clause
+ * must be an inequality (<, <=, >, >=) between a column of the right input
+ * and an expression over the left input; its direction decides the sort
+ * order.  The other conjuncts are just filters.  The input tree is not
+ * modified, since callers may reuse raw parse trees.
+ */
+static JoinExpr *
+transformAsofToLateralJoin(ParseState *pstate, JoinExpr *j)
+{
+	const char *rname;
+	List	   *conjuncts;
+	ListCell   *lc;
+	A_Expr	   *asofcond = NULL;
+	ColumnRef  *sortcol = NULL;
+	bool		descending = false;
+	ColumnRef  *star;
+	ResTarget  *rt;
+	SortBy	   *sortby;
+	A_Const    *limit;
+	A_Const    *truecond;
+	SelectStmt *sub;
+	RangeSubselect *rs;
+	JoinExpr   *result;
+
+	Assert(j->isAsof);
+	Assert(j->jointype == JOIN_INNER || j->jointype == JOIN_LEFT);
+
+	/*
+	 * Find the name the right input is visible under.  The subquery we build
+	 * is given the same name, so that references to it elsewhere in the
+	 * query keep working.
+	 */
+	if (IsA(j->rarg, RangeVar))
+	{
+		RangeVar   *rv = (RangeVar *) j->rarg;
+
+		rname = rv->alias ? rv->alias->aliasname : rv->relname;
+	}
+	else if (IsA(j->rarg, RangeSubselect) &&
+			 ((RangeSubselect *) j->rarg)->alias != NULL)
+		rname = ((RangeSubselect *) j->rarg)->alias->aliasname;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("right side of ASOF JOIN must be a table or an aliased subquery"),
+				 parser_errposition(pstate, exprLocation(j->rarg))));
+
+	/* The grammar flattens a AND b AND c into a single BoolExpr */
+	if (IsA(j->quals, BoolExpr) &&
+		((BoolExpr *) j->quals)->boolop == AND_EXPR)
+		conjuncts = ((BoolExpr *) j->quals)->args;
+	else
+		conjuncts = list_make1(j->quals);
+
+	foreach(lc, conjuncts)
+	{
+		Node	   *qual = (Node *) lfirst(lc);
+		A_Expr	   *a;
+		const char *opname;
+		bool		is_lt;
+		ColumnRef  *col;
+		bool		desc;
+
+		if (!IsA(qual, A_Expr))
+			continue;
+		a = (A_Expr *) qual;
+		if (a->kind != AEXPR_OP || list_length(a->name) != 1)
+			continue;
+
+		opname = strVal(linitial(a->name));
+		if (strcmp(opname, "<") == 0 || strcmp(opname, "<=") == 0)
+			is_lt = true;
+		else if (strcmp(opname, ">") == 0 || strcmp(opname, ">=") == 0)
+			is_lt = false;
+		else
+			continue;
+
+		/*
+		 * We want the right row closest to the left value on the allowed
+		 * side: "left > right" (or "right < left") asks for the largest
+		 * qualifying right value, hence a descending sort.
+		 */
+		if (asofIsRightColumn(a->rexpr, rname) &&
+			asofIsLeftOnly(a->lexpr, rname))
+		{
+			col = (ColumnRef *) a->rexpr;
+			desc = !is_lt;
+		}
+		else if (asofIsRightColumn(a->lexpr, rname) &&
+				 asofIsLeftOnly(a->rexpr, rname))
+		{
+			col = (ColumnRef *) a->lexpr;
+			desc = is_lt;
+		}
+		else
+			continue;
+
+		if (asofcond != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("ASOF JOIN condition must contain exactly one inequality between the joined relations"),
+					 parser_errposition(pstate, a->location)));
+		asofcond = a;
+		sortcol = col;
+		descending = desc;
+	}
+
+	if (asofcond == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("ASOF JOIN condition must contain an inequality between a column of \"%s\" and the left side",
+						rname),
+				 parser_errposition(pstate, exprLocation(j->quals))));
+
+	/* SELECT * */
+	star = makeNode(ColumnRef);
+	star->fields = list_make1(makeNode(A_Star));
+	star->location = -1;
+
+	rt = makeNode(ResTarget);
+	rt->val = (Node *) star;
+	rt->location = -1;
+
+	/* ORDER BY <right column> [DESC] */
+	sortby = makeNode(SortBy);
+	sortby->node = (Node *) copyObject(sortcol);
+	sortby->sortby_dir = descending ? SORTBY_DESC : SORTBY_ASC;
+	sortby->sortby_nulls = SORTBY_NULLS_DEFAULT;
+	sortby->location = -1;
+
+	/* LIMIT 1 */
+	limit = makeNode(A_Const);
+	limit->val.ival.type = T_Integer;
+	limit->val.ival.ival = 1;
+	limit->location = -1;
+
+	sub = makeNode(SelectStmt);
+	sub->targetList = list_make1(rt);
+	sub->fromClause = list_make1(j->rarg);
+	sub->whereClause = j->quals;
+	sub->sortClause = list_make1(sortby);
+	sub->limitCount = (Node *) limit;
+	sub->limitOption = LIMIT_OPTION_COUNT;
+
+	rs = makeNode(RangeSubselect);
+	rs->lateral = true;
+	rs->subquery = (Node *) sub;
+	rs->alias = makeAlias(rname, NIL);
+
+	/* ... ON true */
+	truecond = makeNode(A_Const);
+	truecond->val.boolval.type = T_Boolean;
+	truecond->val.boolval.boolval = true;
+	truecond->location = -1;
+
+	result = makeNode(JoinExpr);
+	result->jointype = j->jointype;
+	result->isNatural = false;
+	result->isAsof = false;
+	result->larg = j->larg;
+	result->rarg = (Node *) rs;
+	result->quals = (Node *) truecond;
+	result->alias = j->alias;
+
+	return result;
+}
+
+/*
  * transformFromClauseItem -
  *	  Transform a FROM-clause item, adding any required entries to the
  *	  range table list being built in the ParseState, and return the
@@ -1169,6 +1419,10 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		bool		lateral_ok;
 		int			sv_namespace_length;
 		int			k;
+
+		/* ASOF joins are executed as LATERAL joins; rewrite before analysis */
+		if (j->isAsof)
+			j = transformAsofToLateralJoin(pstate, j);
 
 		/*
 		 * Recursively process the left subtree, then the right.  We must do
