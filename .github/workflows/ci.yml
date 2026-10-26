@@ -1,0 +1,97 @@
+# Builds PostgreSQL and runs the core regression suite on every pull request.
+#
+# Upstream's own CI lives in .cirrus.yml / .cirrus.tasks.yml and needs a Cirrus account
+# plus GCP images, so we leave those files alone and run our own here.
+#
+# The configure flags match the ones in README.md on purpose: a failure here should be
+# reproducible locally with the commands people already use. --enable-cassert in
+# particular is what turns a malformed parse or plan tree into an assertion failure at the
+# point it is built, rather than wrong output much later.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes the previous run on the same branch; a full build plus check is
+# too expensive to run twice over.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check:
+    name: build + make check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex libreadline-dev zlib1g-dev ccache perl
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          # The key rotates per run so every run writes a fresh entry; restore-keys then
+          # falls back to the most recent one. Without this, the cache is written once
+          # and never updated.
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=500M
+          ccache --zero-stats
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          ./configure \
+            --prefix="$PWD/install" \
+            --enable-debug \
+            --enable-cassert \
+            --without-icu \
+            CFLAGS='-O0 -g'
+
+      - name: Build
+        run: make -j"$(nproc)" -s
+
+      - name: Install
+        run: make -s install
+
+      - name: ccache statistics
+        run: ccache --show-stats
+
+      # make check builds a temporary install and runs the suite against a server on its
+      # own port, so it needs no database set up by us. It must not run as root, and the
+      # GitHub runner user is not root, so this works as-is.
+      - name: Run the regression suite
+        run: make check
+
+      # The exit status alone says nothing useful. regression.diffs is the expected-vs-
+      # actual output per failing test, and the log directory holds the server logs,
+      # which is where a crash or an assertion failure shows up.
+      - name: Upload regression output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-output
+          path: |
+            src/test/regress/regression.diffs
+            src/test/regress/regression.out
+            src/test/regress/log/
+            src/test/regress/results/
+          if-no-files-found: ignore
+          retention-days: 14
