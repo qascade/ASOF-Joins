@@ -1,0 +1,86 @@
+name: Project task
+description: A unit of work from the plan (a phase issue, or anything that produces a PR)
+title: "feat(scope): "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Title must be a Conventional Commit, e.g. `feat(parser): add ASOF and MATCH_CONDITION keywords`.
+        Types: `feat` `fix` `docs` `test` `perf` `refactor` `build` `ci` `chore` `revert`.
+        Scopes: `parser` `analyzer` `planner` `executor` `explain` `nodes` `bench` `docs` `ci` `build` `regress`.
+
+  - type: input
+    id: plan-id
+    attributes:
+      label: Plan ID
+      description: The issue ID from `plan.md`, if this comes from the plan.
+      placeholder: P1-A2
+    validations:
+      required: false
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Phase
+      options:
+        - "Phase 0 — environment and tooling"
+        - "Phase 1 — MVP by query rewrite"
+        - "Phase 2 — native ASOF join"
+        - "Not part of a phase"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Layer
+      description: Which part of the engine this touches. Keep a task to one layer where possible.
+      options:
+        - "Parser / grammar"
+        - "Analyzer / rewrite"
+        - "Planner / paths / costing"
+        - "Executor"
+        - "EXPLAIN / deparse / node support"
+        - "Tests, benchmark, docs or CI"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What this task covers, and the files it is expected to touch.
+      placeholder: |
+        - In `src/backend/parser/gram.y`, extend `joined_table` with the ASOF variants.
+        - Accept `ASOF JOIN` and `ASOF LEFT [OUTER] JOIN`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: The observable condition that closes this issue. Not "the code is written".
+      placeholder: |
+        - `make check` green with the new cases in `src/test/regress/sql/asof_join.sql`.
+        - The four accepted syntax shapes parse without error.
+    validations:
+      required: true
+
+  - type: input
+    id: reviewer
+    attributes:
+      label: Reviewer
+      description: Who reviews the PR (one of the other two, per the rotation in `plan.md`).
+      placeholder: "@qascade"
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes and references
+      description: Relevant section of `docs/asof-join.pdf`, upstream code to model on, gotchas.
+    validations:
+      required: false

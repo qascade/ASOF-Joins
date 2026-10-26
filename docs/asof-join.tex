@@ -137,53 +137,201 @@ is on \emph{why} each technique works, not merely what to type.
 
 \section{A motivating scenario}
 
-Consider a market-data warehouse with two tables. Trades record executions; quotes record
-the best bid and ask prevailing at an instant. Both are append-only streams, both are
-timestamped, and --- crucially --- their timestamps do not line up.
+Consider a market-data warehouse with two tables. \emph{Trades} record executions --- what
+was actually bought or sold, at what price. \emph{Quotes} record the best bid and ask
+prevailing at an instant --- what the market was \emph{offering} at that moment.
 
 \begin{lstlisting}
 CREATE TABLE trades (symbol text, ts timestamptz, price numeric, size int);
 CREATE TABLE quotes (symbol text, ts timestamptz, bid numeric, ask numeric);
 \end{lstlisting}
 
-The analytical question is almost always the same: \emph{for each trade, what was the
-market showing at the moment it executed?} That requires, per trade, the most recent quote
-for the same symbol at or before the trade's timestamp.
+Both are append-only streams, both are timestamped, and --- crucially --- \emph{their
+timestamps do not line up}. This is not sloppiness in the data; it is inherent. Quotes
+change when a market maker revises an offer, which may be thousands of times a second or
+not at all for minutes. Trades happen when somebody accepts an offer. They are two
+independent processes writing to two independent clocks, so the probability that a trade
+carries exactly the same timestamp as some quote is essentially zero.
+
+The analytical question is nearly always the same:
+
+\begin{quote}
+\emph{For each trade, what was the market showing at the moment it executed?}
+\end{quote}
+
+Answering it requires, for each trade, the \textbf{most recent quote for the same symbol at
+or before that trade's timestamp}. Three qualifiers, each load-bearing: \emph{most recent}
+(not any), \emph{same symbol} (not any symbol), \emph{at or before} (not after).
+
+\subsection{A worked example}
+
+Table~\ref{tab:worked} gives six trades and seven quotes across two symbols. Read it as two
+interleaved timelines per symbol.
 
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{@{}llr@{\qquad}llrr@{}}
+\begin{tabular}{@{}clll r@{\qquad\qquad}clll rr@{}}
 \toprule
-\multicolumn{3}{c}{\textbf{trades}} & \multicolumn{4}{c}{\textbf{quotes}}\\
-\cmidrule(r){1-3}\cmidrule(l){4-7}
-symbol & ts & price & symbol & ts & bid & ask\\
+\multicolumn{5}{c}{\textbf{trades} ($L$)} & \multicolumn{6}{c}{\textbf{quotes} ($R$)}\\
+\cmidrule(r){1-5}\cmidrule(l){6-11}
+\# & symbol & ts & & price & \# & symbol & ts & & bid & ask\\
 \midrule
-AAPL & 09:30:02 & 189.10 & AAPL & 09:30:00 & 189.00 & 189.05\\
-AAPL & 09:30:07 & 189.20 & AAPL & 09:30:05 & 189.15 & 189.20\\
-MSFT & 09:30:04 & 410.50 & AAPL & 09:30:09 & 189.25 & 189.30\\
-       &          &        & MSFT & 09:30:01 & 410.40 & 410.45\\
+$\ell_1$ & AAPL & 09:30:02 & & 189.10 & $r_1$ & AAPL & 09:30:00 & & 189.00 & 189.05\\
+$\ell_2$ & AAPL & 09:30:07 & & 189.20 & $r_2$ & AAPL & 09:30:05 & & 189.15 & 189.20\\
+$\ell_3$ & AAPL & 09:30:08 & & 189.22 & $r_3$ & AAPL & 09:30:09 & & 189.25 & 189.30\\
+$\ell_4$ & MSFT & 09:30:04 & & 410.50 & $r_4$ & AAPL & 09:30:12 & & 189.28 & 189.33\\
+$\ell_5$ & MSFT & 09:30:11 & & 410.55 & $r_5$ & MSFT & 09:30:01 & & 410.40 & 410.45\\
+$\ell_6$ & TSLA & 09:30:06 & & 242.00 & $r_6$ & MSFT & 09:30:10 & & 410.52 & 410.58\\
+         &      &          & &        & $r_7$ & MSFT & 09:30:15 & & 410.60 & 410.66\\
 \bottomrule
 \end{tabular}
-\caption{A trade at 09:30:07 must match the quote at 09:30:05 --- not 09:30:09, which had
-not happened yet, and not 09:30:00, which was stale.}
+\caption{Six trades, seven quotes, three symbols. Note that TSLA has trades but no quotes
+at all, and that AAPL quote $r_3$ arrives \emph{between} two AAPL trades.}
+\label{tab:worked}
 \end{table}
 
-The same shape recurs far outside finance:
+The correct \asof{} left join --- one output row per trade, no more and no fewer --- is
+Table~\ref{tab:workedout}.
 
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}cllrcll p{5.1cm}@{}}
+\toprule
+\# & symbol & trade ts & price & match & bid & ask & \textbf{why}\\
+\midrule
+$\ell_1$ & AAPL & 09:30:02 & 189.10 & $r_1$ & 189.00 & 189.05 & only AAPL quote so far\\
+$\ell_2$ & AAPL & 09:30:07 & 189.20 & $r_2$ & 189.15 & 189.20 & $r_1$ is stale, $r_3$ is in the future\\
+$\ell_3$ & AAPL & 09:30:08 & 189.22 & $r_2$ & 189.15 & 189.20 & \emph{same} match as $\ell_2$: no quote in between\\
+$\ell_4$ & MSFT & 09:30:04 & 410.50 & $r_5$ & 410.40 & 410.45 & nearest MSFT quote; AAPL quotes irrelevant\\
+$\ell_5$ & MSFT & 09:30:11 & 410.55 & $r_6$ & 410.52 & 410.58 & $r_7$ at 09:30:15 has not happened yet\\
+$\ell_6$ & TSLA & 09:30:06 & 242.00 & $\bot$ & NULL & NULL & no TSLA quote exists at all\\
+\bottomrule
+\end{tabular}
+\caption{The answer. Six trades in, six rows out.}
+\label{tab:workedout}
+\end{table}
+
+\subsection{Reading the answer row by row}
+
+Every row of Table~\ref{tab:workedout} illustrates something the implementation must get
+right, so it is worth going through them slowly.
+
+\paragraph{$\ell_1$ --- the straightforward case.} The AAPL trade at 09:30:02 has exactly
+one AAPL quote before it, $r_1$ at 09:30:00. Nothing to choose between.
+
+\paragraph{$\ell_2$ --- the case that defines the operator.} The trade at 09:30:07 has two
+AAPL quotes before it ($r_1$ at :00, $r_2$ at :05) and two after ($r_3$ at :09, $r_4$ at
+:12). The answer is $r_2$. Both wrong answers are instructive:
 \begin{itemize}[nosep]
-\item \textbf{IoT / telemetry.} Align a dense sensor stream with a sparse stream of
-      calibration or configuration changes: which calibration was in force when this
-      reading was taken?
-\item \textbf{Slowly-changing dimensions.} A fact row must join the dimension version that
-      was current at the fact's event time, not the version current today.
-\item \textbf{Experiment analysis.} Attribute each event to the most recent assignment,
-      exposure or consent record preceding it.
-\item \textbf{Log correlation.} Pair an error with the last deploy before it.
+\item Picking $r_1$ gives a \emph{stale} quote --- the market had already moved from
+      189.00/189.05 to 189.15/189.20 two seconds before the trade. Any slippage or spread
+      analysis built on it is measuring a market state that no longer existed.
+\item Picking $r_3$ (09:30:09) means using information from \emph{two seconds after} the
+      trade executed.
 \end{itemize}
 
-In every case one side is ``events'' and the other is ``state that changes over time'',
-and the join condition is \emph{temporal precedence plus recency}, not equality.
+\paragraph{$\ell_3$ --- the repeated match.} The trade at 09:30:08 also matches $r_2$,
+because no new AAPL quote arrived between 09:30:07 and 09:30:08. Two distinct left rows
+legitimately share one right row. This is normal and common --- quotes are ``state'', and
+state persists until it changes --- but it tells us something important about the
+implementation: whatever algorithm we use must be able to hand out the same right tuple
+more than once, without re-finding it and without consuming it. Chapter~\ref{ch:phase2}
+turns exactly this observation into the reason no rewind is needed.
+
+\paragraph{$\ell_4$ --- why the key matters.} The MSFT trade at 09:30:04 must match $r_5$
+(MSFT at 09:30:01), even though AAPL's $r_2$ at 09:30:05 is \emph{closer in time} and AAPL's
+$r_1$ at 09:30:00 is also nearby. Nearness in time is only meaningful \emph{within} a
+symbol; a quote for a different instrument carries no information about this one. The
+partition key is not an optimisation, it is part of the definition.
+
+\paragraph{$\ell_5$ --- the boundary.} The MSFT trade at 09:30:11 matches $r_6$ (09:30:10),
+one second earlier, and must not match $r_7$ (09:30:15), four seconds later. Note how little
+separates a right answer from a wrong one here: a comparison written in the wrong direction
+produces $r_7$, which is plausible-looking output with no error and no warning.
+
+\paragraph{$\ell_6$ --- no match at all.} The TSLA trade has no TSLA quote anywhere in the
+table. Under \asof{} \emph{left} join it still appears, with NULL bid and ask --- we do not
+silently lose a trade just because we cannot price it. Under \asof{} \emph{inner} join it
+would be dropped. The choice matters: a trade count that changes depending on quote coverage
+is a reconciliation nightmare, which is why the left variant is the common default.
+
+\subsection{Three ways to get this wrong}
+
+The row-by-row walk exposes a hierarchy of failure modes, and they are not equally bad.
+
+\paragraph{1. Staleness (bad).} Matching too old a quote --- $r_1$ instead of $r_2$ for
+$\ell_2$. The result is wrong but in a bounded, noisy way: measurements are blurred by
+however long the stale period was. It tends to show up as inexplicable variance.
+
+\paragraph{2. Cross-key leakage (worse).} Matching a row from the wrong partition --- AAPL's
+quote against an MSFT trade. The result is not merely imprecise, it is meaningless, and
+because the timestamps look sensible it can survive a casual review. In the implementation
+this failure mode has a specific cause: forgetting to reset per-key state when the key
+changes (remark~(B) of \S\ref{sec:candidate}).
+
+\paragraph{3. Lookahead (worst).} Matching a quote from \emph{after} the trade --- $r_3$ for
+$\ell_2$, or $r_7$ for $\ell_5$. This is the one failure that is actively dangerous rather
+than merely wrong, because it \emph{improves} the apparent quality of the analysis. A
+strategy backtested against quotes that were not yet knowable will appear to predict the
+market, since it has been handed the answer. The error is invisible in the output --- every
+row is populated, every timestamp is nearby, nothing is NULL --- and only shows up as money
+lost when the same strategy runs live against quotes that genuinely are not available yet.
+In finance this is \emph{lookahead bias}, and avoiding it is precisely why the operator is
+defined with $\le$ rather than ``nearest in absolute value''.
+
+\begin{keyidea}[Why not just ``nearest'']
+A tempting simplification is ``match the closest quote in either direction''. Apply it to
+$\ell_3$, the AAPL trade at 09:30:08: the nearest AAPL quote is $r_3$ at 09:30:09, one second
+\emph{after} the trade, beating $r_2$ at 09:30:05 three seconds before it. Symmetric nearness
+picks the future quote whenever the next revision happens to be sooner than the last one was
+--- which, for any actively quoted instrument, is roughly half the time. \asof{} is
+directional by design, and that directionality is the entire point.
+\end{keyidea}
+
+\subsection{The same shape outside finance}
+
+Strip away the vocabulary and the pattern is: one table of \textbf{events}, one table of
+\textbf{state that changes over time}, joined on ``which state was in force when this event
+happened''.
+
+\paragraph{IoT and telemetry.} A sensor reports a reading every second; a technician
+recalibrates the sensor occasionally. To interpret a reading you need the calibration in
+force at that moment.
+\begin{center}\small
+\begin{tabular}{@{}llr@{\qquad}llr@{}}
+\toprule
+\multicolumn{3}{c}{\textbf{readings} (events)} & \multicolumn{3}{c}{\textbf{calibrations} (state)}\\
+\cmidrule(r){1-3}\cmidrule(l){4-6}
+sensor & ts & raw & sensor & ts & offset\\
+\midrule
+s7 & 14:02:11 & 512 & s7 & 09:00:00 & $+1.2$\\
+s7 & 14:02:12 & 514 & s7 & 13:45:00 & $-0.4$\\
+\bottomrule
+\end{tabular}
+\end{center}
+Both readings take the $-0.4$ offset, not $+1.2$: the recalibration at 13:45 superseded it.
+Note that the state table is \emph{sparse} --- two rows for a whole day --- while the event
+table is dense. That asymmetry ($|L| \gg |R|$ or the reverse) is typical and matters for
+costing (Chapter~\ref{ch:planner}).
+
+\paragraph{Slowly-changing dimensions.} A warehouse keeps every version of a customer
+record with a validity start date. A sale from March must join the address, tier and
+discount the customer had \emph{in March}, not the ones they have today. Using today's
+version is the warehouse equivalent of lookahead bias, and \asof{} is precisely the
+``as-of-then'' lookup the name refers to.
+
+\paragraph{Experiment and consent analysis.} Each event must be attributed to the most
+recent variant assignment, feature-flag value, or consent record preceding it. Attributing
+an event to an assignment made \emph{after} it inflates the measured effect of the
+experiment --- lookahead bias again, in a different costume.
+
+\paragraph{Operational log correlation.} Pair each error with the last deploy before it. The
+deploy after the error did not cause it, however close in time.
+
+In all of these, one side is events, the other is state, and the join condition is
+\emph{temporal precedence plus recency}, not equality.
 
 \section{Formal definition}
 
@@ -212,6 +360,37 @@ where $\bot$ denotes ``no match''. The \emph{\asof{} left join} is
 with $m(\ell)$ replaced by a tuple of NULLs when $m(\ell) = \bot$; the \emph{inner} variant
 drops those rows instead.
 \end{definition}
+
+\subsection{Reading the definition against the example}
+
+Definition~\ref{def:asof} is compact, so it is worth decoding it against
+Table~\ref{tab:worked} one symbol at a time. Take $\ell = \ell_2$, the AAPL trade at
+09:30:07.
+
+\begin{itemize}[leftmargin=*]
+\item $k_L(\ell_2) = \text{AAPL}$ and $t_L(\ell_2) = \text{09:30:07}$. These are the two
+      things about the left row the operator looks at; the price is carried along but plays
+      no part in matching.
+\item The \textbf{candidate set} $C(\ell_2)$ applies two filters to $R$ at once. The first,
+      $k_R(r) = k_L(\ell)$, keeps only AAPL quotes: $\{r_1, r_2, r_3, r_4\}$, discarding the
+      MSFT rows. The second, $t_R(r) \le t_L(\ell)$, keeps only those at or before 09:30:07,
+      leaving $C(\ell_2) = \{r_1, r_2\}$. Everything the trade \emph{could} legitimately
+      match is now in this set, and everything it must not match has been excluded.
+\item $\arg\max_{r \in C(\ell)} t_R(r)$ then picks the one with the largest timestamp:
+      $r_2$ at 09:30:05. Read ``$\arg\max$'' as ``the element that maximises'' --- it returns
+      the \emph{tuple} $r_2$, not the timestamp 09:30:05. This is the ``most recent'' part of
+      ``most recent quote at or before''.
+\item For $\ell_6$, the TSLA trade, the key filter alone empties the set:
+      $C(\ell_6) = \varnothing$, so $m(\ell_6) = \bot$ and the left join emits the trade with
+      NULLs.
+\item $\ell \circ m(\ell)$ denotes concatenating the left tuple with its match, which is how
+      one row of Table~\ref{tab:workedout} is formed.
+\end{itemize}
+
+The structure to notice is that the definition is \emph{filter, then take the maximum}, in
+that order. Chapter~\ref{ch:phase1} shows that reversing those two steps --- taking the
+maximum and then filtering --- gives a different and wrong answer, which is the single most
+important correctness point in the whole implementation.
 
 Three properties of Definition~\ref{def:asof} drive everything that follows.
 
@@ -291,18 +470,6 @@ quadratic-then-filtered. A dedicated operator is what allows the engine to explo
 (P1)--(P3) and compute the answer in one ordered pass.
 \end{keyidea}
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Show that the \asof{} left join of Definition~\ref{def:asof} always has exactly $|L|$
-      rows, even when $R$ is empty.
-\item Give a pair of relations for which
-      $L \bowtie_{\text{asof}} R \neq R \bowtie_{\text{asof}} L$ even after renaming
-      columns, confirming (P2).
-\item The window-function formulation above partitions by \code{(t.symbol, t.ts)}. What goes
-      wrong if two distinct trades share a symbol and timestamp, and how would you fix it?
-\item Suppose $t_R$ values are unique within a key. Does the $\arg\max$ in
-      Definition~\ref{def:asof} still need tie-breaking? What if they are not unique?
-\end{enumerate}
 
 % ============================================================
 \chapter{How Other Systems Do It}
@@ -495,16 +662,6 @@ its selectivity is estimated through the generic subquery path. The optimiser ca
 instance, decide to sort both inputs once --- that plan is not in the search space, because
 the query as written does not describe it.
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Derive the $nm/2$ figure of Chapter~1 for the range-join formulation, then compare it
-      with the $n\log m$ of the LATERAL form at $n = m = 10^6$. By what factor do they
-      differ?
-\item Why can PostgreSQL not place a \code{Materialize} node above the correlated inner
-      side of this nested loop?
-\item Rewrite the LATERAL query for the ``earliest following quote'' variant. Which two
-      things change?
-\end{enumerate}
 
 % ============================================================
 \chapter{Anatomy of a PostgreSQL Query}\label{ch:anatomy}
@@ -623,15 +780,6 @@ needs to remember across calls must be copied with \code{ExecCopySlot} into a sl
 owns --- a rule that Phase~2's candidate buffer depends on absolutely
 (\S\ref{sec:candidate}).
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Which stage would reject \code{SELECT * FROM nonexistent}? Which would reject
-      \code{SELECT FROM WHERE}?
-\item Why must node types be registered for \code{copyObject} and \code{outNode} even if
-      the plan is never written to disk? (Hint: prepared statements, parallel workers.)
-\item Explain, in terms of Figure~\ref{fig:pipeline}, why Phase~1 cannot improve
-      performance over the hand-written LATERAL query.
-\end{enumerate}
 
 % ============================================================
 \chapter{Phase 1 --- The Rewrite Technique}\label{ch:phase1}
@@ -822,6 +970,20 @@ general: the left side returns the best $\theta$-satisfying row, the right side 
 globally best row if it satisfies $\theta$ and nothing otherwise.
 \end{lemma}
 
+Concretely, take $\ell_4$ (MSFT, 09:30:04) from Table~\ref{tab:worked}. Without the key
+predicate, the subquery computes ``the latest quote of \emph{any} symbol at or before
+09:30:04''. The candidates are $r_1$ (AAPL, 09:30:00) and $r_5$ (MSFT, 09:30:01); the latest
+is $r_5$, the outer \code{ON} accepts it because the symbols match, and the query happens to
+produce the right answer.
+
+That accident is what makes the bug dangerous. Add a single AAPL quote at 09:30:03 --- an
+entirely ordinary thing for the data to contain --- and the subquery now returns \emph{that}
+row as the latest. The outer \code{ON} rejects it, AAPL~$\neq$~MSFT, and $\ell_4$ reports no
+match at all: a trade with a perfectly good MSFT quote three seconds before it comes back
+NULL. The failure surfaces only when another key's rows interleave, so it passes a small
+hand-made test and fails on real data --- precisely the shape of bug the differential test of
+Chapter~\ref{ch:measuring} exists to catch.
+
 This lemma is why the predicate must be pushed \emph{through} the \code{LIMIT}, i.e.\ into
 the subquery, where it filters before the $\arg\max$. It also explains why PostgreSQL's own
 optimiser will never perform this pushdown for us: predicate pushdown past a \code{LIMIT}
@@ -876,18 +1038,6 @@ The analyser must verify, with a \code{parser\_errposition()} on the offending n
 Every one of these gets a regression test with stable expected output. An error message is
 an interface: once released it is as hard to change as the syntax itself.
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Why does the translation use \code{SELECT *} over the original \code{rarg} rather than
-      enumerating columns? What would break with an enumerated list?
-\item Construct a two-row, two-key counterexample demonstrating the key-placement lemma
-      concretely.
-\item The analyser flips the comparison when the operands appear in the opposite order.
-      Write out the four flipped forms and confirm they map onto
-      Table~\ref{tab:directions}.
-\item Phase~1 performs its rewrite before transforming \code{rarg}. What goes wrong if it
-      runs after?
-\end{enumerate}
 
 % ============================================================
 \chapter{Phase 2 --- The Merge Technique}\label{ch:phase2}
@@ -1133,20 +1283,21 @@ candidate $10$ without any rewind.}
 perform 4 independent index descents instead.}
 \end{table}
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Run the algorithm by hand on Figure~\ref{fig:merge} with the strict operator $<$.
-      Which output row changes?
-\item Modify the pseudocode for \code{ASOF JOIN} (inner). Where exactly does the change go,
-      and does Invariant~\ref{inv:cand} still hold?
-\item Suppose the outer side were \emph{not} sorted within a key. Give a three-row example
-      producing a wrong answer, illustrating the monotonicity remark.
-\item What is the peak memory of the merge pass, excluding sorts? Compare with
-      \file{nodeMergejoin.c}'s requirement when the inner side needs materialising.
-\item Why can the inner cursor safely skip past a key that the outer never visits? Which
-      line does that, and what would happen if it compared with \code{<=} instead
-      of \code{<}?
-\end{enumerate}
+\paragraph{The strict variant.} Running the same data with $<$ in place of $\le$ changes
+nothing in Figure~\ref{fig:merge}, because no outer timestamp coincides with an inner one.
+That is precisely why test data must be built to contain exact coincidences: give the inner
+side a row at $t = 7$ and the two variants diverge at outer row $7$ --- non-strict absorbs it
+and answers $7$, strict stops at $6$. A single comparison operator in loop~(D) separates the
+two, and no amount of testing on non-coinciding data will tell you which one you compiled.
+
+\paragraph{What the trace shows about cost.} Four outer rows consumed five inner advances,
+and the cursor moved monotonically. A LATERAL plan over the same data performs four
+independent index descents --- each starting from the root, each a fresh random access ---
+and learns nothing from one to the next. The gap widens with $n$: the merge pass does
+$O(n + m)$ \emph{sequential} steps in total, while the LATERAL plan does $n$ \emph{random}
+descents of $O(\log m)$ each. Chapter~\ref{ch:planner} explains how the planner is taught to
+reach for the former.
+
 
 % ============================================================
 \chapter{Making the Planner Choose It}\label{ch:planner}
@@ -1273,17 +1424,6 @@ instrument that makes the Chapter~\ref{ch:measuring} benchmark and differential 
 possible at all, since it lets the same query text run through both implementations in the
 same session.
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Explain why \code{(ts, symbol)} is the wrong index for an \asof{} join on
-      \code{symbol} and why \code{(symbol, ts)} is right.
-\item The required pathkeys put equality keys first. Could the algorithm be reformulated to
-      allow $t$ first? What would it cost?
-\item Under what circumstances would a nested-loop \asof{} plan actually be cheaper than the
-      merge plan? Should we offer it?
-\item Why does the planner need both \code{initial\_cost} and \code{final\_cost} functions
-      rather than computing the exact cost once?
-\end{enumerate}
 
 % ============================================================
 \chapter{Correctness Corners}
@@ -1331,15 +1471,6 @@ over a shared inner stream does not partition trivially; the natural parallelisa
 per-key-range, which requires a partitioned sort and is out of scope. Mark it, assert it,
 and note the follow-up.
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Construct test data in which the strict/non-strict distinction changes the result for
-      exactly one row.
-\item Why does the NULL-in-key rule require an equality operator rather than the sort
-      comparator? Write the two-row example that distinguishes them.
-\item Design the correlated-subquery test that would catch a missing candidate reset in
-      \code{ExecReScanAsofJoin}.
-\end{enumerate}
 
 % ============================================================
 \chapter{Measuring It}\label{ch:measuring}
@@ -1428,15 +1559,6 @@ NULL density, random tie frequency, and a randomly chosen operator. Property-bas
 finds the corners of Chapter~7 far more reliably than hand-written cases, because it does
 not share the implementer's blind spots.
 
-\section{Exercises}
-\begin{enumerate}[leftmargin=*]
-\item Why is \code{EXCEPT ALL} in both directions necessary, rather than a single
-      \code{EXCEPT}?
-\item The equivalence check above compares multisets. How should it be amended for queries
-      whose results differ legitimately due to ties?
-\item Predict the shape of the native-versus-LATERAL speedup curve as key cardinality rises
-      from 1 to $10^4$, and justify your prediction in terms of \S\ref{sec:candidate}.
-\end{enumerate}
 
 % ============================================================
 \appendix
