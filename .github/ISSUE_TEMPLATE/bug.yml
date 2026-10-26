@@ -1,0 +1,74 @@
+name: Bug
+description: Wrong results, a crash, or a build/test failure in our ASOF code
+title: "fix(scope): "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a wrong-answer bug, the most valuable thing you can include is the comparison
+        against the hand-written LATERAL form — that is our reference implementation.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Observed behaviour, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: Minimal SQL — table definitions, the rows, the query.
+      render: sql
+      placeholder: |
+        CREATE TABLE l (k text, ts int);
+        CREATE TABLE r (k text, ts int, v int);
+        INSERT INTO l VALUES ('a', 5);
+        INSERT INTO r VALUES ('a', 3, 1), ('a', 7, 2);
+        SELECT * FROM l ASOF LEFT JOIN r MATCH_CONDITION (l.ts >= r.ts) ON l.k = r.k;
+    validations:
+      required: true
+
+  - type: textarea
+    id: plan
+    attributes:
+      label: EXPLAIN output
+      description: "`EXPLAIN (ANALYZE, BUFFERS)` for the failing query, if it runs at all."
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: guc
+    attributes:
+      label: Which implementation
+      description: Does it reproduce with the native join, the Phase 1 rewrite, or both?
+      options:
+        - "enable_asofjoin = on (native) only"
+        - "enable_asofjoin = off (rewrite) only"
+        - "Both"
+        - "Not applicable / does not build"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`, plus the branch.
+      placeholder: "460f088 on feat/lateral_join_impl"
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Build and platform
+      description: OS, compiler, and your configure line (cassert on or off matters a lot).
+      placeholder: |
+        macOS 14.5, clang 15, ./configure --enable-debug --enable-cassert --without-icu
+    validations:
+      required: true
