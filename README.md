@@ -17,12 +17,13 @@ sudo apt install build-essential gdb bison flex libreadline-dev zlib1g-dev
 **macOS**
 
 ```bash
-xcode-select --install          # clang, make, bison, flex, readline — that is all you need
+xcode-select --install          # clang, make, flex, readline
+brew install bison m4           # bison 3.8+ and the m4 it needs
 ```
 
-Nothing from Homebrew is required: the Command Line Tools ship a new enough bison and flex,
-and `configure` finds readline on its own. See [macOS notes](#macos-notes) below for the
-differences from the Linux commands and for when you might still want Homebrew's bison.
+Apple ships bison 2.3 (from 2006), which builds PostgreSQL but is useless for the grammar
+work ahead of us. `pgenv.sh` puts Homebrew's bison and m4 on `PATH` for you, so there is
+nothing to add to your shell profile. See [macOS notes](#macos-notes) for why.
 
 In VS Code, install the **C/C++** extension (`ms-vscode.cpptools`).
 
@@ -81,43 +82,66 @@ template asks you to paste the summary line. On failure, read
 
 ## macOS notes
 
-Verified on macOS 14.5 (Apple clang, SDK 14.4) with the stock Command Line Tools:
+Verified on macOS 14.5 (Apple clang, SDK 14.4) with Homebrew bison 3.8.2 and m4 1.4.21:
 `configure` clean, full build clean, **231 of 231 regression tests passed**.
 
 Differences from the Linux instructions:
 
 | Linux | macOS |
 |---|---|
-| `sudo apt install ...` | `xcode-select --install` |
+| `sudo apt install ...` | `xcode-select --install` + `brew install bison m4` |
 | `make -j$(nproc)` | `make -j$(sysctl -n hw.ncpu)` |
 | `gdb` | `lldb` — see the debugger note below |
 
-What `configure` picks up on a stock machine, for reference:
+### Why Homebrew bison, and why m4 comes with it
+
+Apple's `/usr/bin/bison` is **2.3**, which is exactly PostgreSQL's minimum, so `configure`
+accepts it and the tree builds. It is still the wrong tool for this project: bison 3.8+
+supports `-Wcounterexamples`, which turns an unhelpful
 
 ```
-checking for bison... /usr/bin/bison
-configure: using bison (GNU Bison) 2.3
-checking for flex... /usr/bin/flex
-configure: using flex 2.6.4 Apple(flex-34)
-checking for library containing readline... -lreadline
+gram.y: warning: 1 shift/reduce conflict
 ```
 
-A few things worth knowing:
+into a concrete pair of inputs the grammar cannot tell apart. We are adding productions to
+`src/backend/parser/gram.y` in Phase 1, so that diagnostic is the difference between a
+five-minute fix and an afternoon.
 
-- **Apple's bison is 2.3, from 2006.** PostgreSQL's minimum is exactly 2.3, so it builds
-  fine, and `configure` accepts it without a warning. It is only a problem once you start
-  editing `src/backend/parser/gram.y`: bison 3.8+ supports `-Wcounterexamples`, which turns
-  an unhelpful "shift/reduce conflict" into a concrete pair of inputs that the grammar cannot
-  tell apart. When you get to the grammar work, install the newer one and put it first on
-  `PATH` — it is keg-only, so it is not linked into `/opt/homebrew/bin` by default:
+`m4` is needed because Homebrew's bison shells out to it, and macOS does not really ship
+one: `/usr/bin/m4` is an `xcode-select` shim that aborts the build with
 
-  ```bash
-  brew install bison
-  export PATH="$(brew --prefix bison)/bin:$PATH"
-  bison --version                        # expect 3.8.x
-  ```
+```
+xcode-select: Failed to locate 'm4', requesting installation of command line developer tools.
+make[1]: *** [parser/gram.h] Error 2
+```
 
-  Re-run `./configure` after changing `PATH` so it records the new bison.
+Both formulae are **keg-only** — Homebrew deliberately does not link them into
+`/opt/homebrew/bin`, because they shadow Apple's versions. Rather than editing your shell
+profile, `pgenv.sh` prepends both to `PATH` when `brew` is present (a no-op on Linux), so
+`. ./pgenv.sh` is all you need:
+
+```bash
+. ./pgenv.sh
+bison --version                 # expect 3.8.x, not 2.3
+```
+
+If you had already configured with Apple's bison, re-run `./configure` after sourcing
+`pgenv.sh` so it records the new one.
+
+### Checking the grammar for conflicts
+
+`BISONFLAGS` appends `$(YFLAGS)`, so counterexamples can be switched on per build without
+editing any makefile:
+
+```bash
+touch src/backend/parser/gram.y
+make -C src/backend/parser YFLAGS=-Wcounterexamples
+```
+
+On an unmodified tree this prints nothing, which is the baseline: `gram.y` has no conflicts,
+so **any** conflict your change introduces is yours to fix, not a pre-existing one.
+
+### Other things worth knowing
 
 - **The VS Code debug tasks do not work as-is on macOS.** `.vscode/launch.json` sets
   `"MIMode": "gdb"`, and gdb on Apple silicon needs code signing that nobody wants to set
