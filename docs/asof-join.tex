@@ -1,0 +1,1516 @@
+\documentclass[11pt,a4paper]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{mathpazo}
+\usepackage[margin=1.05in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,calc,fit,backgrounds}
+\usepackage[hidelinks,colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
+
+\definecolor{linkblue}{HTML}{1F4E79}
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codeframe}{HTML}{D6DBE1}
+\definecolor{kw}{HTML}{A3254A}
+\definecolor{cmt}{HTML}{5A7D5A}
+\definecolor{str}{HTML}{1F6F8B}
+\definecolor{accent}{HTML}{1F4E79}
+\definecolor{warn}{HTML}{8A5A00}
+
+% ---------- theorem-like environments ----------
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[chapter]
+\newtheorem{example}[definition]{Example}
+\newtheorem{remark}[definition]{Remark}
+\theoremstyle{plain}
+\newtheorem{theorem}[definition]{Theorem}
+\newtheorem{lemma}[definition]{Lemma}
+\newtheorem{invariant}[definition]{Invariant}
+
+% ---------- listings ----------
+\lstdefinestyle{sqlstyle}{
+  language=SQL,
+  morekeywords={ASOF,MATCH_CONDITION,LATERAL,OVER,PARTITION,WINDOW,RETURNING,EXPLAIN,
+                ANALYZE,BUFFERS,GENERATED,MATERIALIZED,GUC},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{codeframe},
+  framesep=5pt, xleftmargin=6pt, xrightmargin=0pt,
+  breaklines=true, showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+}
+\lstdefinestyle{cstyle}{
+  language=C,
+  morekeywords={bool,List,Node,Expr,JoinType,PlanState,TupleTableSlot,ExprState,
+                AsofJoinState,JoinExpr,Query,Path,Plan,ListCell,Oid,Datum},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{codeframe},
+  framesep=5pt, xleftmargin=6pt,
+  breaklines=true, showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+}
+\lstdefinestyle{algstyle}{
+  language={},
+  keywords={for,each,in,while,if,else,emit,return,not,and,or,is,EOF,COPY,EMPTY,NULL},
+  keywordstyle=\color{kw}\bfseries,
+  morecomment=[l]{\#},
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{codeframe},
+  framesep=5pt, xleftmargin=6pt,
+  breaklines=false, showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+  numbers=left, numberstyle=\tiny\color{gray}, numbersep=8pt,
+}
+\lstdefinestyle{plain}{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{codeframe},
+  framesep=5pt, xleftmargin=6pt,
+  breaklines=true, showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+}
+\lstset{style=sqlstyle}
+\emergencystretch=3em
+\hbadness=4000
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\file}[1]{\texttt{\footnotesize #1}}
+\newcommand{\asof}{{\normalfont\scshape asof}}
+
+% boxed "key idea"
+\newenvironment{keyidea}[1][Key idea]{%
+  \par\medskip\noindent
+  \begin{tikzpicture}
+  \node[draw=accent,line width=0.9pt,fill=accent!4,rounded corners=2pt,
+        inner sep=9pt,text width=\dimexpr\linewidth-26pt\relax,align=left] (box) \bgroup
+  \textbf{\color{accent}#1.}\ \ignorespaces}
+  {\egroup; \end{tikzpicture}\par\medskip}
+
+\title{\vspace{-1.5cm}\Huge \textbf{The ASOF Join}\\[0.3cm]
+       \Large A Study Guide for Implementing Temporal\\ Nearest-Match Joins in PostgreSQL}
+\author{CS631 Project --- Deepjyoti Kakoti (26M0774)\\
+        Debasish Bordoloi (26M0776) \quad Shubh Karman Singh (26M0843)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+An \asof{} join matches each row of a left relation to the \emph{nearest preceding} row of
+a right relation, ordered by time and optionally partitioned by a key. It is the natural
+operator for aligning two unsynchronised time series --- trades against quotes, readings
+against calibration events, facts against slowly-changing dimensions. DuckDB, ClickHouse,
+Snowflake, kdb+ and QuestDB all provide it; PostgreSQL does not, and users fall back on a
+hand-written \code{LEFT JOIN LATERAL ... ORDER BY ... LIMIT 1}.
+
+This document is the study companion for a two-phase project that adds \asof{} join to
+PostgreSQL~17. It develops the operator from its formal definition, explains why the
+existing workaround is both awkward and asymptotically worse than it needs to be, walks
+through the stages of PostgreSQL's query processor, and then treats each implementation
+phase as a technique worth understanding in its own right: Phase~1 as a
+\emph{semantics-preserving source-to-source rewrite}, Phase~2 as a \emph{sort-merge
+streaming algorithm} with a proof of correctness and a cost model. The emphasis throughout
+is on \emph{why} each technique works, not merely what to type.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================
+\chapter{The Problem}
+% ============================================================
+
+\section{A motivating scenario}
+
+Consider a market-data warehouse with two tables. Trades record executions; quotes record
+the best bid and ask prevailing at an instant. Both are append-only streams, both are
+timestamped, and --- crucially --- their timestamps do not line up.
+
+\begin{lstlisting}
+CREATE TABLE trades (symbol text, ts timestamptz, price numeric, size int);
+CREATE TABLE quotes (symbol text, ts timestamptz, bid numeric, ask numeric);
+\end{lstlisting}
+
+The analytical question is almost always the same: \emph{for each trade, what was the
+market showing at the moment it executed?} That requires, per trade, the most recent quote
+for the same symbol at or before the trade's timestamp.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llr@{\qquad}llrr@{}}
+\toprule
+\multicolumn{3}{c}{\textbf{trades}} & \multicolumn{4}{c}{\textbf{quotes}}\\
+\cmidrule(r){1-3}\cmidrule(l){4-7}
+symbol & ts & price & symbol & ts & bid & ask\\
+\midrule
+AAPL & 09:30:02 & 189.10 & AAPL & 09:30:00 & 189.00 & 189.05\\
+AAPL & 09:30:07 & 189.20 & AAPL & 09:30:05 & 189.15 & 189.20\\
+MSFT & 09:30:04 & 410.50 & AAPL & 09:30:09 & 189.25 & 189.30\\
+       &          &        & MSFT & 09:30:01 & 410.40 & 410.45\\
+\bottomrule
+\end{tabular}
+\caption{A trade at 09:30:07 must match the quote at 09:30:05 --- not 09:30:09, which had
+not happened yet, and not 09:30:00, which was stale.}
+\end{table}
+
+The same shape recurs far outside finance:
+
+\begin{itemize}[nosep]
+\item \textbf{IoT / telemetry.} Align a dense sensor stream with a sparse stream of
+      calibration or configuration changes: which calibration was in force when this
+      reading was taken?
+\item \textbf{Slowly-changing dimensions.} A fact row must join the dimension version that
+      was current at the fact's event time, not the version current today.
+\item \textbf{Experiment analysis.} Attribute each event to the most recent assignment,
+      exposure or consent record preceding it.
+\item \textbf{Log correlation.} Pair an error with the last deploy before it.
+\end{itemize}
+
+In every case one side is ``events'' and the other is ``state that changes over time'',
+and the join condition is \emph{temporal precedence plus recency}, not equality.
+
+\section{Formal definition}
+
+Fix two relations: $L$ (the \emph{probe} or outer side) and $R$ (the \emph{build} or inner
+side). Let $t_L$ and $t_R$ be the match attributes --- the timestamps --- and let
+$k_L, k_R$ be (possibly empty) tuples of partition-key attributes.
+
+\begin{definition}[\asof{} match]\label{def:asof}
+For a left tuple $\ell \in L$, define the \emph{candidate set}
+\[
+  C(\ell) \;=\; \{\, r \in R \;:\; k_R(r) = k_L(\ell) \ \wedge\ t_R(r) \le t_L(\ell) \,\}.
+\]
+The \asof{} match of $\ell$ is
+\[
+  m(\ell) \;=\;
+  \begin{cases}
+    \arg\max_{r \in C(\ell)} t_R(r), & C(\ell) \neq \varnothing,\\[2pt]
+    \bot, & C(\ell) = \varnothing,
+  \end{cases}
+\]
+where $\bot$ denotes ``no match''. The \emph{\asof{} left join} is
+\[
+  L \mathbin{\raisebox{0.1ex}{$\bowtie$}_{\!\text{asof}}^{\;\text{left}}} R
+  \;=\; \{\, \ell \circ m(\ell) \;:\; \ell \in L \,\},
+\]
+with $m(\ell)$ replaced by a tuple of NULLs when $m(\ell) = \bot$; the \emph{inner} variant
+drops those rows instead.
+\end{definition}
+
+Three properties of Definition~\ref{def:asof} drive everything that follows.
+
+\begin{enumerate}[label=(P\arabic*),leftmargin=*]
+\item \textbf{Exactly one match per left row.} The output cardinality of the left variant is
+      precisely $|L|$, independent of $|R|$. This is unusual: it makes \asof{} a
+      \emph{function} from $L$ to $R \cup \{\bot\}$ rather than a relation, and it means
+      the planner can estimate output rows with certainty.
+\item \textbf{Asymmetry.} $\arg\max$ picks the \emph{latest preceding} right row. Swapping
+      $L$ and $R$ gives a different answer, so \asof{} is \emph{not commutative} --- a fact
+      that constrains join reordering (Chapter~\ref{ch:planner}).
+\item \textbf{Order dependence.} The operator is defined in terms of $\le$ and $\max$ on
+      $t$, so it only makes sense for a type with a total order --- in PostgreSQL terms, a
+      type with a \code{btree} operator family. Hash equality is not enough.
+\end{enumerate}
+
+\begin{remark}[The four directions]
+Definition~\ref{def:asof} uses $\le$ (``the latest quote at or before the trade''), which
+is the common case. Three variants follow by symmetry: $<$ (strictly before), $\ge$ and $>$
+(the \emph{earliest following} row, i.e.\ $\arg\min$). Our syntax admits all four:
+\code{MATCH\_CONDITION (l.ts >= r.ts)} is $\le$ read from the left row's point of view.
+Everything in this document is stated for $\le$; the others are obtained by reversing the
+comparison and the sort direction, and by excluding the equality case for the strict forms.
+\end{remark}
+
+\section{Why ordinary joins cannot express this}
+
+\subsection*{Equi-join is too strict}
+
+\begin{lstlisting}
+SELECT * FROM trades t JOIN quotes q
+  ON t.symbol = q.symbol AND t.ts = q.ts;   -- almost always empty
+\end{lstlisting}
+Two independent streams rarely share exact timestamps. With microsecond resolution the
+match probability is essentially zero, and the result is an empty relation --- a silent
+wrong answer rather than an error.
+
+\subsection*{Range join is too permissive}
+
+Relaxing equality to inequality finds \emph{every} preceding quote, not the nearest one:
+
+\begin{lstlisting}
+SELECT * FROM trades t JOIN quotes q
+  ON t.symbol = q.symbol AND q.ts <= t.ts;   -- many-to-many blow-up
+\end{lstlisting}
+
+The damage is quantitative, not just semantic. Suppose $n$ trades and $m$ quotes are spread
+uniformly over the same interval, within a single symbol. A trade at quantile $u \in [0,1]$
+of the interval matches roughly $um$ quotes, so the expected intermediate cardinality is
+\[
+  \sum_{i=1}^{n} \mathbb{E}[u_i m] \;=\; n\,m \int_0^1 u \,du \;=\; \frac{nm}{2}.
+\]
+For $n = m = 10^6$ that is $5\times 10^{11}$ intermediate rows, to be reduced back to
+$10^6$. The work is quadratic in the data size although the answer is linear in it.
+
+\subsection*{Filtering the range join with a window function}
+
+The standard SQL repair picks the nearest row out of the blow-up:
+
+\begin{lstlisting}
+SELECT * FROM (
+  SELECT t.*, q.bid, q.ask,
+         row_number() OVER (PARTITION BY t.symbol, t.ts ORDER BY q.ts DESC) AS rn
+  FROM trades t JOIN quotes q
+    ON t.symbol = q.symbol AND q.ts <= t.ts
+) s WHERE rn = 1;
+\end{lstlisting}
+
+This is \emph{correct}, and it is how the operator is often emulated in systems without it.
+But it materialises the $nm/2$ intermediate rows before discarding all but $n$ of them: the
+filter is applied after the damage. No amount of planner cleverness recovers the linear
+algorithm from this formulation, because the window function is opaque to the join planner.
+
+\begin{keyidea}
+\asof{} is not sugar. The three SQL encodings above are respectively wrong, quadratic, and
+quadratic-then-filtered. A dedicated operator is what allows the engine to exploit
+(P1)--(P3) and compute the answer in one ordered pass.
+\end{keyidea}
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Show that the \asof{} left join of Definition~\ref{def:asof} always has exactly $|L|$
+      rows, even when $R$ is empty.
+\item Give a pair of relations for which
+      $L \bowtie_{\text{asof}} R \neq R \bowtie_{\text{asof}} L$ even after renaming
+      columns, confirming (P2).
+\item The window-function formulation above partitions by \code{(t.symbol, t.ts)}. What goes
+      wrong if two distinct trades share a symbol and timestamp, and how would you fix it?
+\item Suppose $t_R$ values are unique within a key. Does the $\arg\max$ in
+      Definition~\ref{def:asof} still need tie-breaking? What if they are not unique?
+\end{enumerate}
+
+% ============================================================
+\chapter{How Other Systems Do It}
+% ============================================================
+
+Borrowing a design is cheaper than inventing one, and divergence from established
+semantics is a bug report waiting to happen. Table~\ref{tab:systems} summarises the
+landscape.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}p{1.9cm}p{5.1cm}p{2.3cm}p{3.1cm}@{}}
+\toprule
+\textbf{System} & \textbf{Syntax} & \textbf{Keys} & \textbf{Notes}\\
+\midrule
+DuckDB &
+\code{ASOF JOIN r ON l.k = r.k AND l.ts >= r.ts} &
+equalities in \code{ON} &
+Inequality lives in \code{ON}; supports \code{LEFT}; one inequality required.\\
+
+ClickHouse &
+\code{ASOF LEFT JOIN r ON l.k = r.k AND l.ts >= r.ts} &
+equalities in \code{ON} &
+Inequality must be last; requires at least one equality key.\\
+
+Snowflake &
+\code{ASOF JOIN r MATCH\_CONDITION (l.ts >= r.ts) ON l.k = r.k} &
+separate \code{ON} &
+Match condition is syntactically distinct from the keys.\\
+
+kdb+/q &
+\code{aj[`k`ts; l; r]} &
+positional &
+Function, not SQL; requires sorted, attribute-tagged tables.\\
+
+QuestDB &
+\code{l ASOF JOIN r ON (k)} &
+\code{ON (k)} &
+Designated timestamp column is implicit in the table definition.\\
+\bottomrule
+\end{tabular}
+\caption{\asof{} join across systems.}
+\label{tab:systems}
+\end{table}
+
+\section{Why we follow Snowflake}
+
+The project adopts Snowflake's shape:
+
+\begin{lstlisting}
+FROM trades t ASOF LEFT JOIN quotes q
+  MATCH_CONDITION (t.ts >= q.ts)
+  ON t.symbol = q.symbol
+\end{lstlisting}
+
+Three reasons, all of them implementation-driven:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Separation of concerns.} The DuckDB/ClickHouse style mixes one inequality and
+      $n$ equalities in a single \code{ON} clause, then requires the analyser to pick the
+      inequality apart from the rest and reject anything else. Keeping
+      \code{MATCH\_CONDITION} separate turns a validation problem into a grammar problem,
+      and grammar problems produce better error messages and cleaner positions
+      (\code{parser\_errposition}).
+\item \textbf{No overloading of \code{ON}.} In PostgreSQL, \code{ON} already feeds
+      \code{transformJoinOnClause} and ultimately the planner's restriction-clause
+      machinery, where an inequality would be treated as an ordinary filter. Giving the
+      match condition its own clause means it can be stored in its own \code{JoinExpr}
+      field and never mistaken for a qual.
+\item \textbf{Room for extension.} A distinct clause gives an obvious home for future
+      \code{TOLERANCE}/window bounds (``match only within 5 seconds''), which several
+      systems offer and which we may add later.
+\end{enumerate}
+
+The cost is that queries are not copy-paste portable from DuckDB. We judge discoverable
+errors and a clean parse tree worth more than cross-dialect portability in a teaching
+implementation.
+
+\section{Semantic choices to pin down}
+
+Systems quietly disagree on the corners. We must choose, document, and test each:
+
+\begin{table}[h]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{4.3cm}p{8.4cm}@{}}
+\toprule
+\textbf{Corner} & \textbf{Our choice}\\
+\midrule
+NULL in match column & Never matches (NULL comparisons are unknown, so the row is filtered).\\
+NULL in a partition key & Never matches, consistent with \code{=} semantics.\\
+Ties on $t_R$ within a key & Implementation-defined: one arbitrary tuple. Documented, and
+Phase~2 must agree with Phase~1.\\
+Empty right side & Left variant returns all left rows NULL-extended.\\
+Strict operators ($<$, $>$) & Equal timestamps excluded.\\
+Zero equality keys & Allowed: a single global ordered stream.\\
+\bottomrule
+\end{tabular}
+\caption{Semantic decisions, to be enforced by the regression suite.}
+\end{table}
+
+\begin{remark}[On ties]
+Picking ``an arbitrary tuple'' is defensible but must be \emph{consistently} arbitrary
+across phases, or the differential test of Chapter~\ref{ch:measuring} will flag diffs that
+are not bugs. The practical rule: Phase~1's \code{ORDER BY ts DESC LIMIT 1} and Phase~2's
+``last candidate seen in ascending order'' happen to agree when the sort is stable on the
+same key set, and the tests compare multisets after excluding tie rows.
+\end{remark}
+
+% ============================================================
+\chapter{What PostgreSQL Does Today}
+% ============================================================
+
+\section{The LATERAL workaround}
+
+Without \asof{}, the idiomatic PostgreSQL formulation is a correlated subquery in the
+\code{FROM} clause:
+
+\begin{lstlisting}
+SELECT t.symbol, t.ts, t.price, q.bid, q.ask
+FROM trades t
+LEFT JOIN LATERAL (
+    SELECT q.bid, q.ask
+    FROM quotes q
+    WHERE q.symbol = t.symbol
+      AND q.ts    <= t.ts
+    ORDER BY q.ts DESC
+    LIMIT 1
+) q ON true;
+\end{lstlisting}
+
+\code{LATERAL} is what makes this legal: it permits the subquery to reference \code{t},
+the relation to its left. Semantically the subquery is re-evaluated for each row of
+\code{trades}, and \code{ORDER BY ... LIMIT 1} performs the $\arg\max$ of
+Definition~\ref{def:asof} directly. \code{LEFT JOIN ... ON true} supplies the
+NULL-extension when the subquery returns no row.
+
+This is correct. It is also:
+
+\begin{itemize}[nosep]
+\item \textbf{verbose} --- eleven lines encoding one idea, with the correlation, the sort
+      direction, the \code{LIMIT} and the \code{ON true} each independently easy to get
+      wrong;
+\item \textbf{fragile} --- writing \code{ORDER BY q.ts} instead of \code{q.ts DESC} yields
+      the \emph{oldest} quote, silently;
+\item \textbf{dependent on an index} for acceptable performance, as the next section shows.
+\end{itemize}
+
+\section{Cost analysis}
+
+The plan is a nested loop with the subquery on the inner side.
+
+\paragraph{With a suitable index.} Given
+\code{CREATE INDEX ON quotes (symbol, ts DESC)}, each inner evaluation is a
+\code{Limit} over an \code{Index Scan} whose scan key is
+\code{symbol = \$1 AND ts <= \$2}. Because the index is ordered, the scan descends to the
+right leaf and stops after one tuple. Per outer row the cost is one index descent,
+$O(\log m)$, giving
+\[
+  T_{\text{lateral}} \;=\; O\!\left(n \log m\right).
+\]
+Each descent is a handful of random page accesses; with $n = 10^6$ that is $10^6$
+independent descents, and the constant is dominated by cache misses on the upper index
+levels and by per-tuple executor overhead for the \code{Limit}/\code{Index Scan} node pair.
+
+\paragraph{Without one.} The inner side becomes a \code{Sort} over a filtered
+\code{Seq Scan} (or at best a \code{Top-N heapsort}), re-executed per outer row:
+\[
+  T_{\text{lateral}}^{\text{no index}} \;=\; O\!\left(n \cdot m\right),
+\]
+which for $n = m = 10^6$ is $10^{12}$ tuple comparisons --- hours, not seconds. Nested-loop
+rescans are not amortised; PostgreSQL will reuse the inner \code{Materialize} node only
+when the inner side is \emph{not} correlated, and here it necessarily is.
+
+\begin{keyidea}
+The workaround's shape forces a \emph{per-row search}. Even in the good case it pays
+$\log m$ random descents $n$ times, because nothing tells the engine that consecutive
+outer rows probe nearby positions in the same ordered inner relation. Phase~2's whole
+contribution is to exploit exactly that locality.
+\end{keyidea}
+
+\section{A third problem: planning}
+
+Beyond asymptotics, the LATERAL form limits the planner. The subquery is a black box with
+a \code{LIMIT}: it cannot be hash-joined, cannot be parallelised across the inner side, and
+its selectivity is estimated through the generic subquery path. The optimiser cannot, for
+instance, decide to sort both inputs once --- that plan is not in the search space, because
+the query as written does not describe it.
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Derive the $nm/2$ figure of Chapter~1 for the range-join formulation, then compare it
+      with the $n\log m$ of the LATERAL form at $n = m = 10^6$. By what factor do they
+      differ?
+\item Why can PostgreSQL not place a \code{Materialize} node above the correlated inner
+      side of this nested loop?
+\item Rewrite the LATERAL query for the ``earliest following quote'' variant. Which two
+      things change?
+\end{enumerate}
+
+% ============================================================
+\chapter{Anatomy of a PostgreSQL Query}\label{ch:anatomy}
+% ============================================================
+
+To extend the engine one must know where to cut. PostgreSQL processes a query in five
+stages, each consuming one data structure and producing the next.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  node distance=5mm,
+  stage/.style={draw=accent,fill=accent!6,rounded corners=2pt,minimum height=9mm,
+                inner xsep=5pt,font=\footnotesize\bfseries,align=center},
+  arr/.style={-{Stealth[length=2mm]},accent,thick},
+  lbl/.style={font=\scriptsize\ttfamily,text=black!65}
+]
+\node[stage] (p) {Parse};
+\node[stage,right=of p] (a) {Analyze};
+\node[stage,right=of a] (r) {Rewrite};
+\node[stage,right=of r] (o) {Plan};
+\node[stage,right=of o] (e) {Execute};
+\draw[arr] (p)--(a); \draw[arr] (a)--(r); \draw[arr] (r)--(o); \draw[arr] (o)--(e);
+\node[lbl,below=1.5mm of p] {RawStmt};
+\node[lbl,below=1.5mm of a] {Query};
+\node[lbl,below=1.5mm of r] {Query[]};
+\node[lbl,below=1.5mm of o] {PlannedStmt};
+\node[lbl,below=1.5mm of e] {tuples};
+\node[font=\scriptsize,above=1mm of p,text=black!60] {gram.y};
+\node[font=\scriptsize,above=1mm of a,text=black!60] {parse\_clause.c};
+\node[font=\scriptsize,above=1mm of r,text=black!60] {rewriteHandler.c};
+\node[font=\scriptsize,above=1mm of o,text=black!60] {joinpath.c};
+\node[font=\scriptsize,above=1mm of e,text=black!60] {nodeXxx.c};
+\end{tikzpicture}
+\caption{The five stages, the structure each produces, and a representative source file.}
+\label{fig:pipeline}
+\end{figure}
+
+\section{Stage by stage}
+
+\paragraph{1. Parse (\file{src/backend/parser/gram.y}, \file{scan.l}).}
+A Bison grammar turns text into a \emph{raw parse tree}: a tree of nodes that mirrors the
+syntax and resolves \emph{nothing}. Table names are strings, column references are
+\code{ColumnRef} lists, and no catalog is consulted. The parser's only job is to decide
+whether the text is well-formed and to record its shape. A \code{FROM} clause join becomes
+a \code{JoinExpr} with \code{larg}, \code{rarg}, \code{jointype}, \code{quals} and
+\code{usingClause}.
+
+\paragraph{2. Analyze (\file{parser/analyze.c}, \file{parse\_clause.c}, \file{parse\_expr.c}).}
+Semantic analysis resolves names against the catalog, assigns types, and produces a
+\code{Query}. Range-table entries (\code{RangeTblEntry}) replace table names; \code{Var}
+nodes with \code{(varno, varattno)} replace column references; operators are resolved to
+specific \code{Oid}s through overload resolution. The \code{FROM} clause is processed by
+\code{transformFromClauseItem()}, which is recursive over \code{JoinExpr} --- this is the
+function Phase~1 hooks.
+
+\paragraph{3. Rewrite (\file{rewrite/rewriteHandler.c}).}
+Views are expanded and rules applied, \code{Query} in, \code{Query} out. The \asof{}
+project does not touch this stage, but it matters for one reason: a view defined over an
+\asof{} join must survive expansion, which is why the node must deparse correctly
+(\file{ruleutils.c}).
+
+\paragraph{4. Plan (\file{optimizer/}).}
+The planner converts a \code{Query} into a \code{PlannedStmt}. Internally it works with
+\code{RelOptInfo} (a relation, base or join) and \code{Path} (one way of producing that
+relation, with a cost and a sort order). \code{add\_paths\_to\_joinrel()} in
+\file{path/joinpath.c} proposes every join strategy for a pair of relations; the cheapest
+surviving \code{Path} is turned into a \code{Plan} by \file{plan/createplan.c}. Phase~2
+adds a \code{Path} type here and teaches \file{path/costsize.c} what it costs.
+
+\paragraph{5. Execute (\file{executor/}).}
+The \code{Plan} tree is instantiated as a \code{PlanState} tree and pulled one tuple at a
+time: each node's \code{ExecProcNode} returns a \code{TupleTableSlot} or NULL at end of
+stream. This is the Volcano iterator model, and it is why a streaming merge algorithm fits
+so naturally. Phase~2 adds \file{executor/nodeAsofjoin.c}.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Stage} & \textbf{Structure} & \textbf{Phase 1 touches} & \textbf{Phase 2 touches}\\
+\midrule
+Parse    & \code{RawStmt}, \code{JoinExpr} & grammar, new fields & --- \\
+Analyze  & \code{Query}, \code{Var}, \code{RTE} & validation + rewrite & emit \code{JOIN\_ASOF}\\
+Rewrite  & \code{Query} & deparse only & deparse only\\
+Plan     & \code{Path}, \code{Plan}, \code{PathKey} & --- & path, cost, plan\\
+Execute  & \code{PlanState}, slots & --- & new node\\
+\bottomrule
+\end{tabular}
+\caption{Where each phase intervenes. Phase~1 deliberately stops at stage~2.}
+\label{tab:touchpoints}
+\end{table}
+
+\begin{keyidea}
+Phase~1 and Phase~2 differ in \emph{which stage they stop at}. Phase~1 rewrites the parse
+tree and lets stages 3--5 run untouched; Phase~2 carries a new concept all the way to
+stage~5. That is why Phase~1 is low-risk and Phase~2 is where the performance is.
+\end{keyidea}
+
+\section{Two structures worth studying before Phase 2}
+
+\paragraph{\code{PathKey}.} A \code{PathKey} is the planner's representation of ``this path
+produces tuples ordered by expression $e$, using operator family $f$, ascending or
+descending, nulls first or last''. A list of them is a sort order. Crucially,
+\code{PathKey}s are \emph{canonicalised}: two paths claiming the same order share pointer-equal
+\code{PathKey} objects, so order compatibility is tested by list-prefix comparison
+rather than expression matching. This is the mechanism by which a merge join avoids a sort
+when an index already supplies the order --- and the mechanism Phase~2 reuses.
+
+\paragraph{\code{TupleTableSlot}.} A slot is a holder for one tuple, possibly virtual
+(array of \code{Datum}s), possibly a pointer into a buffer page. Slots are
+\emph{overwritten} by the next \code{ExecProcNode} call on the same child. Any tuple a node
+needs to remember across calls must be copied with \code{ExecCopySlot} into a slot the node
+owns --- a rule that Phase~2's candidate buffer depends on absolutely
+(\S\ref{sec:candidate}).
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Which stage would reject \code{SELECT * FROM nonexistent}? Which would reject
+      \code{SELECT FROM WHERE}?
+\item Why must node types be registered for \code{copyObject} and \code{outNode} even if
+      the plan is never written to disk? (Hint: prepared statements, parallel workers.)
+\item Explain, in terms of Figure~\ref{fig:pipeline}, why Phase~1 cannot improve
+      performance over the hand-written LATERAL query.
+\end{enumerate}
+
+% ============================================================
+\chapter{Phase 1 --- The Rewrite Technique}\label{ch:phase1}
+% ============================================================
+
+\section{Why rewrite at all?}
+
+It is tempting to go straight to the native operator. Rewriting first buys four things:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Zero executor risk.} The rewrite produces a plan the engine already knows how
+      to run correctly. No new crash surface, no new memory-management bugs.
+\item \textbf{A reference implementation.} Phase~2 must agree with \emph{something}. The
+      rewrite is an executable specification of Definition~\ref{def:asof}, and
+      Chapter~\ref{ch:measuring}'s differential test compares the two implementations
+      directly --- an oracle we would otherwise lack.
+\item \textbf{Early feedback on syntax.} The grammar, the error messages and the
+      documentation are all exercised before any planner work begins. If the syntax is
+      wrong, we learn it cheaply.
+\item \textbf{A fallback.} Behind a GUC, the rewrite remains available when the native path
+      is disabled or inapplicable.
+\end{enumerate}
+
+This is a standard compiler technique --- \emph{desugaring}, or source-to-source
+translation into a core language. The new construct is defined by the translation, and the
+existing machinery does the work.
+
+\section{Grammar mechanics}
+
+\subsection{Keyword categories}
+
+PostgreSQL classifies every keyword into one of four categories in
+\file{src/include/parser/kwlist.h}:
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Category} & \textbf{Usable as identifier?} & \textbf{Example}\\
+\midrule
+\code{UNRESERVED\_KEYWORD}   & yes                       & \code{ASOF} (ours)\\
+\code{COL\_NAME\_KEYWORD}    & as a column name only     & \code{BETWEEN}\\
+\code{TYPE\_FUNC\_NAME\_KEYWORD} & not as type/function name & \code{LEFT}\\
+\code{RESERVED\_KEYWORD}     & no                        & \code{SELECT}\\
+\bottomrule
+\end{tabular}
+\caption{Keyword categories, from least to most intrusive.}
+\end{table}
+
+We register \code{ASOF} and \code{MATCH\_CONDITION} as \textbf{unreserved} and add them to
+the \code{unreserved\_keyword:} production in \file{gram.y}. The reason is compatibility:
+an existing application may well have a column called \code{asof} or
+\code{match\_condition}, and reserving the word would break it. Unreserved keywords are
+distinguishable by the parser from context alone.
+
+\begin{keyidea}
+Adding a keyword is a compatibility decision, not a syntax decision. Always start at
+unreserved and escalate only if the grammar genuinely cannot be made unambiguous ---
+and treat ``cannot'' as a claim to be proved by Bison's conflict report, not assumed.
+\end{keyidea}
+
+\subsection{The production}
+
+The join syntax lives in the \code{joined\_table} production. The addition is, in essence:
+
+\begin{lstlisting}[style=plain]
+joined_table:
+    ...
+  | table_ref ASOF opt_outer_join_type JOIN table_ref
+        MATCH_CONDITION '(' a_expr ')' opt_asof_on
+      {
+          JoinExpr *n = makeNode(JoinExpr);
+          n->jointype       = $3;         /* JOIN_INNER or JOIN_LEFT */
+          n->isAsof         = true;
+          n->larg           = $1;
+          n->rarg           = $5;
+          n->matchCondition = $8;
+          n->quals          = $10;        /* may be NULL */
+          $$ = (Node *) n;
+      }
+\end{lstlisting}
+
+Two design points deserve comment.
+
+\paragraph{\code{MATCH\_CONDITION} is mandatory in the grammar.} Making it optional and
+checking later would produce a worse error (``\asof{} join requires a match condition'',
+with no position) than letting Bison report a syntax error at the exact token. Push
+validation into the grammar wherever the grammar can express it.
+
+\paragraph{\code{RIGHT}/\code{FULL} are accepted by the grammar and rejected by the
+analyser.} This looks backwards, but it produces the better message. If the grammar
+excluded them, \code{ASOF RIGHT JOIN} would yield ``syntax error at or near RIGHT'', which
+tells the user nothing. Accepting it and then raising \emph{\asof{} join does not support
+RIGHT outer joins} with a hint is strictly more helpful. The rule of thumb inverts the
+previous one: push validation into the analyser when the analyser can say something the
+grammar cannot.
+
+\subsection{Conflicts}
+
+\file{gram.y} is an LALR(1) grammar with a known, non-zero baseline conflict count
+(declared via \code{\%expect}). Any \emph{new} shift/reduce or reduce/reduce conflict means
+the grammar has become ambiguous at one token of lookahead, and must be fixed rather than
+suppressed. Because \code{ASOF} appears immediately after a complete \code{table\_ref} ---
+the same position as \code{LEFT}, \code{INNER}, \code{CROSS} --- and is followed by a fixed
+token sequence, this addition is conflict-free. Verify, do not assume: build
+\file{src/backend/parser} and compare Bison's report against the baseline.
+
+\section{Parse-tree surgery}
+
+\subsection{The translation}
+
+The heart of Phase~1 is a structural rewrite performed in a new
+\file{src/backend/parser/parse\_asof.c}, invoked from \code{transformFromClauseItem()}
+\emph{before} the right-hand side is transformed. Given
+
+\begin{lstlisting}
+L ASOF LEFT JOIN R MATCH_CONDITION (L.ts >= R.ts) ON L.k = R.k
+\end{lstlisting}
+
+we construct the parse tree that the following text would have produced:
+
+\begin{lstlisting}
+L LEFT JOIN LATERAL (
+    SELECT * FROM R
+    WHERE R.ts <= L.ts AND R.k = L.k
+    ORDER BY R.ts DESC
+    LIMIT 1
+) ON true
+\end{lstlisting}
+
+Concretely: a \code{RangeSubselect} wrapping a \code{SelectStmt} whose \code{fromClause} is
+the original \code{rarg}, with \code{lateral = true}, substituted as the \code{rarg} of an
+ordinary \code{JoinExpr} with \code{quals = makeBoolConst(true, false)}.
+
+\begin{keyidea}
+Rewriting the \emph{raw} parse tree, not the analysed \code{Query}, is what makes this
+cheap. Name resolution, type resolution, \code{LATERAL} validity checking, lateral
+reference marking and subquery planning are all performed afterwards by existing code that
+has no idea \asof{} exists.
+\end{keyidea}
+
+\subsection{Direction, strictness, and the four operators}
+
+The match condition is written from the left row's point of view; the subquery's
+\code{WHERE} needs it from the right row's. Table~\ref{tab:directions} is the whole of it.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{\code{MATCH\_CONDITION}} & \textbf{Meaning} & \textbf{Subquery \code{WHERE}} & \textbf{\code{ORDER BY}}\\
+\midrule
+\code{l.ts >= r.ts} & latest at or before & \code{r.ts <= l.ts} & \code{r.ts DESC}\\
+\code{l.ts > r.ts}  & latest strictly before & \code{r.ts < l.ts} & \code{r.ts DESC}\\
+\code{l.ts <= r.ts} & earliest at or after & \code{r.ts >= l.ts} & \code{r.ts ASC}\\
+\code{l.ts < r.ts}  & earliest strictly after & \code{r.ts > l.ts} & \code{r.ts ASC}\\
+\bottomrule
+\end{tabular}
+\caption{The four admissible match conditions and their translations.}
+\label{tab:directions}
+\end{table}
+
+\subsection{Why the equality keys go \emph{inside} the subquery}
+
+This is the subtlest point in Phase~1, and a natural place to get it wrong. One might
+place \code{L.k = R.k} in the outer join's \code{ON} clause instead:
+
+\begin{lstlisting}
+L LEFT JOIN LATERAL (
+    SELECT * FROM R WHERE R.ts <= L.ts ORDER BY R.ts DESC LIMIT 1
+) q ON L.k = q.k            -- WRONG
+\end{lstlisting}
+
+The result is wrong, not merely slower. The subquery now computes ``the latest preceding
+row of $R$ \emph{over all keys}'', and the outer \code{ON} then discards it if its key
+happens to differ --- producing NULL where a correct match exists. The $\arg\max$ of
+Definition~\ref{def:asof} is taken over the candidate set $C(\ell)$, which is
+\emph{already restricted by the key}; restricting afterwards does not commute with
+$\arg\max$.
+
+\begin{lemma}[Key placement]
+Let $\sigma_\theta$ be selection and $\mathrm{top}_1^{t}$ the ``highest $t$'' operator.
+Then $\mathrm{top}_1^{t}(\sigma_\theta(R)) \neq \sigma_\theta(\mathrm{top}_1^{t}(R))$ in
+general: the left side returns the best $\theta$-satisfying row, the right side returns the
+globally best row if it satisfies $\theta$ and nothing otherwise.
+\end{lemma}
+
+This lemma is why the predicate must be pushed \emph{through} the \code{LIMIT}, i.e.\ into
+the subquery, where it filters before the $\arg\max$. It also explains why PostgreSQL's own
+optimiser will never perform this pushdown for us: predicate pushdown past a \code{LIMIT}
+is unsound, and \code{allpaths.c} correctly refuses it.
+
+\section{Correctness of the translation}
+
+\begin{theorem}[Rewrite equivalence]\label{thm:rewrite}
+For a match condition $t_L \ge t_R$ and key equality $k_L = k_R$, the LATERAL translation
+of \S5.3.1 produces exactly the relation of Definition~\ref{def:asof}, up to the choice
+among tied $t_R$ values.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Fix $\ell \in L$. By the semantics of \code{LATERAL}, the subquery is evaluated with
+$\ell$'s columns bound as constants. Its \code{WHERE} clause then selects exactly
+$\{\, r \in R : k_R(r) = k_L(\ell) \wedge t_R(r) \le t_L(\ell) \,\} = C(\ell)$, which is
+Definition~\ref{def:asof}'s candidate set. \code{ORDER BY t DESC LIMIT 1} returns a tuple
+of $C(\ell)$ with maximal $t_R$ when $C(\ell) \ne \varnothing$ --- i.e.\ an element of
+$\arg\max$ --- and the empty relation otherwise. \code{LEFT JOIN ... ON true} pairs $\ell$
+with that tuple, or NULL-extends it when the subquery is empty, matching $m(\ell) = \bot$.
+Since the construction is per-$\ell$ and the left join preserves every $\ell$ exactly once,
+the two relations agree tuple-for-tuple. Where several $r$ share the maximal $t_R$, both
+formulations select one arbitrarily; agreement holds up to that choice.
+\end{proof}
+
+\begin{remark}
+The restriction to \emph{one} top-level comparison in the match condition (enforced by the
+analyser) is what makes the proof go through: a conjunction or disjunction of inequalities
+would not reduce to a single \code{ORDER BY} direction. This is also exactly the restriction
+Phase~2 needs, which is why it is checked in Phase~1 rather than deferred.
+\end{remark}
+
+\section{Validation and error messages}
+
+The analyser must verify, with a \code{parser\_errposition()} on the offending node:
+
+\begin{enumerate}[nosep,leftmargin=*]
+\item the match condition is a single \code{OpExpr} whose operator is one of
+      \code{>=, >, <=, <};
+\item its left operand references only $L$ and its right operand only $R$ --- checked with
+      \code{pull\_varnos} against the respective namespace items --- or vice versa, in which
+      case the comparison is flipped;
+\item the operand types share a \code{btree} operator family, so the comparison has a total
+      order. This matters for Phase~1 only insofar as \code{ORDER BY} needs it, but it is
+      \emph{essential} for Phase~2's merge, so it is rejected early rather than becoming a
+      planner-time failure;
+\item the \code{ON} clause, if present, is a conjunction of plain $L$-to-$R$ equalities;
+\item the join type is \code{INNER} or \code{LEFT}.
+\end{enumerate}
+
+Every one of these gets a regression test with stable expected output. An error message is
+an interface: once released it is as hard to change as the syntax itself.
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Why does the translation use \code{SELECT *} over the original \code{rarg} rather than
+      enumerating columns? What would break with an enumerated list?
+\item Construct a two-row, two-key counterexample demonstrating the key-placement lemma
+      concretely.
+\item The analyser flips the comparison when the operands appear in the opposite order.
+      Write out the four flipped forms and confirm they map onto
+      Table~\ref{tab:directions}.
+\item Phase~1 performs its rewrite before transforming \code{rarg}. What goes wrong if it
+      runs after?
+\end{enumerate}
+
+% ============================================================
+\chapter{Phase 2 --- The Merge Technique}\label{ch:phase2}
+% ============================================================
+
+\section{The insight}
+
+\begin{keyidea}
+If both inputs are sorted by $(k, t)$ ascending, then as the outer cursor advances, the
+\asof{} match also advances monotonically. The nearest preceding inner row is simply
+\emph{the last inner row seen before the boundary} --- so a single synchronised pass over
+both inputs suffices, with no search and no backtracking.
+\end{keyidea}
+
+The LATERAL plan re-searches the inner relation from scratch for every outer row, throwing
+away everything it learned from the previous one. But the outer rows arrive in increasing
+$t$ order, so each successive probe lands at or after the previous one. Maintaining a
+single inner cursor plus one remembered tuple replaces $n$ independent $O(\log m)$
+descents with $n + m$ sequential steps.
+
+\section{The algorithm}
+\label{sec:candidate}
+
+\begin{lstlisting}[style=algstyle,caption={\asof{} left join, both inputs sorted ascending
+by $(k,t)$. \code{cand} is a slot owned by this node.},captionpos=b]
+AsofJoin(outer, inner):
+  cand        <- EMPTY          # best candidate for the current outer row
+  cand_key    <- NULL           # the key group cand belongs to
+  r           <- next(inner)
+
+  for each l in outer:                                  # (A) ascending by (k,t)
+      if key(l) != cand_key:                            # (B) new key group
+          cand     <- EMPTY
+          cand_key <- key(l)
+
+      while r is not EOF and key(r) <  key(l):          # (C) skip stale keys
+          r <- next(inner)
+
+      while r is not EOF and key(r) == key(l)
+                        and t(r) <= t(l):               # (D) absorb candidates
+          cand <- COPY(r)                               # (E) must copy!
+          r    <- next(inner)
+
+      if cand is EMPTY:
+          emit l o NULLs                                # left-outer
+      else:
+          emit l o cand
+\end{lstlisting}
+
+Five remarks, keyed to the comments:
+
+\begin{description}[leftmargin=*,font=\normalfont\bfseries]
+\item[(A) Both sides are sorted.] The planner guarantees this by requiring pathkeys
+      (Chapter~\ref{ch:planner}); the executor may assume it.
+\item[(B) Key groups are contiguous.] Because the sort is on $(k, t)$ with $k$ leading, all
+      rows of a key arrive together. A key change resets the candidate --- forgetting this
+      reset is the classic bug, and it leaks matches from one symbol to the next.
+\item[(C) and (D) The inner cursor never rewinds.] Line~(C) discards inner keys that the
+      outer has passed; line~(D) advances while the inner row still satisfies the match
+      condition. Both loops only ever call \code{next(inner)}, which is why the total inner
+      work is $O(m)$ across the entire join rather than per outer row.
+\item[(E) The candidate must be \emph{copied}.] \code{cand <- COPY(r)} is
+      \code{ExecCopySlot}, not a pointer assignment. The inner child reuses its output slot
+      on the next \code{ExecProcNode} call, so a retained pointer becomes a dangling
+      reference to a tuple that has already been overwritten --- a bug that manifests as
+      sporadically wrong values rather than a crash, and therefore one to prevent by
+      construction.
+\item[Strict operators] replace \code{t(r) <= t(l)} with \code{t(r) < t(l)} in~(D).
+      The ``earliest following'' variants sort descending, or equivalently reverse the
+      comparison --- the loop structure is unchanged.
+\end{description}
+
+\subsection{Why no mark/restore}
+
+A merge \emph{equi}-join must handle duplicate join keys on the inner side: when the outer
+advances to another row with the same key, the inner cursor has to be rewound to the start
+of that key's run. PostgreSQL implements this with \code{ExecMarkPos}/\code{ExecRestrPos}
+on the inner node, which in turn forces a \code{Materialize} node when the inner plan cannot
+rewind cheaply --- a significant complication in \file{nodeMergejoin.c}.
+
+\asof{} join needs none of it. By property (P1) each outer row has exactly one match, and
+that match is \emph{the last candidate absorbed} --- a single tuple, already held in
+\code{cand}. Consecutive outer rows with the same key continue absorbing from where the
+previous one stopped; the candidate is only ever extended forward, never re-scanned. The
+one-tuple buffer replaces the entire mark/restore mechanism.
+
+\begin{keyidea}
+\asof{}'s ``exactly one match'' property is not just a semantic curiosity --- it is what
+collapses merge join's rewind machinery into a single remembered tuple. A weaker operator
+would need the full apparatus.
+\end{keyidea}
+
+\section{Correctness}
+
+\begin{invariant}[Candidate]\label{inv:cand}
+At the point where the algorithm emits a row for outer tuple $\ell$, either
+\code{cand} holds a tuple $r^\star$ with
+\[
+  r^\star \in C(\ell) \quad\text{and}\quad t_R(r^\star) = \max_{r \in C(\ell)} t_R(r),
+\]
+or \code{cand} is empty and $C(\ell) = \varnothing$.
+\end{invariant}
+
+\begin{proof}[Proof]
+By induction over the outer stream.
+
+\emph{Base.} Before the first outer tuple, \code{cand} is empty and \code{cand\_key} is
+NULL, so line~(B) resets and the loops at (C),(D) run from the start of the inner stream.
+
+\emph{Step.} Assume the invariant held for the previous outer tuple $\ell'$. Two cases.
+
+\textsc{Case 1: } $k(\ell) \neq k(\ell')$. Line~(B) empties \code{cand}. Line~(C) advances
+$r$ past all inner keys less than $k(\ell)$; since the inner stream is sorted, no inner row
+with key $k(\ell)$ has been consumed and discarded (consumption only happens in~(C), for
+strictly smaller keys, or in~(D), for the previous key group). Line~(D) then absorbs
+precisely those rows with key $k(\ell)$ and $t_R \le t_L(\ell)$, in ascending $t_R$ order,
+assigning each to \code{cand}; the last assignment is therefore the maximum. If no such row
+exists, \code{cand} remains empty and indeed $C(\ell) = \varnothing$.
+
+\textsc{Case 2: } $k(\ell) = k(\ell')$. Then \code{cand} still holds the maximal element of
+$C(\ell')$. Because the outer stream is sorted on $(k,t)$, $t_L(\ell) \ge t_L(\ell')$, hence
+$C(\ell') \subseteq C(\ell)$: the candidate set only grows. The rows of
+$C(\ell) \setminus C(\ell')$ are exactly those with key $k(\ell)$ and
+$t_L(\ell') < t_R \le t_L(\ell)$, which are the next rows in the inner stream and are
+precisely what loop~(D) now absorbs, again in ascending order. After the loop \code{cand}
+holds the maximum over $C(\ell') \cup (C(\ell)\setminus C(\ell')) = C(\ell)$, since the
+previous candidate was maximal over $C(\ell')$ and each absorbed row is compared by
+recency. If both are empty, $C(\ell) = \varnothing$.
+\end{proof}
+
+\begin{theorem}[Algorithm correctness]
+Given inputs sorted ascending on $(k,t)$, the algorithm of \S\ref{sec:candidate} computes
+the \asof{} left join of Definition~\ref{def:asof}.
+\end{theorem}
+\begin{proof}
+The outer loop visits each $\ell \in L$ exactly once and emits exactly one row for it, so
+the output has $|L|$ rows as required by (P1). By Invariant~\ref{inv:cand}, the emitted row
+is $\ell \circ m(\ell)$ when $C(\ell) \neq \varnothing$ and $\ell$ NULL-extended otherwise,
+which is Definition~\ref{def:asof}. The inner variant differs only in suppressing the
+NULL-extended rows.
+\end{proof}
+
+\begin{remark}[The monotonicity requirement]
+Case~2 of the induction uses $t_L(\ell) \ge t_L(\ell')$ --- the outer stream must be sorted
+\emph{within} a key. If it were not, $C$ could shrink between consecutive outer rows and the
+retained candidate would be too recent. This is precisely why the planner must enforce a
+pathkey on the outer side too, not only on the inner (\S\ref{sec:pathkeys}); sorting only
+the inner side gives a plausible-looking plan that is quietly wrong.
+\end{remark}
+
+\section{Complexity}
+
+Let $n = |L|$, $m = |R|$.
+
+\[
+  T_{\text{asof}} \;=\;
+  \underbrace{O(n \log n) + O(m \log m)}_{\text{sorts, if needed}}
+  \;+\;
+  \underbrace{O(n + m)}_{\text{merge pass}}
+\]
+
+and $O(n + m)$ alone when indexes already supply both orders. Compare with
+$O(n \log m)$ random descents for the LATERAL plan. The asymptotic gap is modest; the
+\emph{constant} is where the win lives:
+
+\begin{itemize}[nosep]
+\item the merge pass is sequential, so it is prefetch- and cache-friendly, whereas index
+      descents are random;
+\item it performs one executor node invocation per tuple, not one subplan execution per
+      outer row;
+\item sorts are performed once, in bulk, with \code{work\_mem}-sized runs, and are
+      skipped entirely when an index on $(k, t)$ exists.
+\end{itemize}
+
+Memory is $O(1)$ beyond the sorts: exactly one candidate tuple, regardless of data size ---
+in contrast to a hash-based strategy, which is not even applicable here because the
+predicate is an inequality.
+
+\section{A worked example}
+
+Figure~\ref{fig:merge} traces the algorithm on one key group.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  x=1.08cm, y=1cm,
+  oin/.style={circle,draw=accent,fill=accent!12,inner sep=1.6pt,font=\scriptsize},
+  rin/.style={rectangle,draw=warn,fill=warn!12,inner sep=2.2pt,font=\scriptsize},
+  ax/.style={-{Stealth[length=2mm]},black!55},
+  mt/.style={-{Stealth[length=1.6mm]},accent!80,dashed,thin}
+]
+% axes
+\draw[ax] (-0.4,2) -- (9.3,2) node[right,font=\scriptsize] {$t$};
+\draw[ax] (-0.4,0) -- (9.3,0) node[right,font=\scriptsize] {$t$};
+\node[font=\scriptsize\bfseries,left=2mm] at (-0.4,2) {outer $L$};
+\node[font=\scriptsize\bfseries,left=2mm] at (-0.4,0) {inner $R$};
+
+% outer tuples at t = 2, 7, 11, 12
+\node[oin] (l1) at (1,2) {}; \node[font=\scriptsize,above=0.5mm] at (1,2) {2};
+\node[oin] (l2) at (3.5,2) {}; \node[font=\scriptsize,above=0.5mm] at (3.5,2) {7};
+\node[oin] (l3) at (6,2) {}; \node[font=\scriptsize,above=0.5mm] at (6,2) {11};
+\node[oin] (l4) at (7,2) {}; \node[font=\scriptsize,above=0.5mm] at (7,2) {12};
+
+% inner tuples at t = 1, 5, 6, 10, 14
+\node[rin] (r1) at (0.5,0) {}; \node[font=\scriptsize,below=0.5mm] at (0.5,0) {1};
+\node[rin] (r2) at (2.5,0) {}; \node[font=\scriptsize,below=0.5mm] at (2.5,0) {5};
+\node[rin] (r3) at (3,0) {};   \node[font=\scriptsize,below=0.5mm] at (3,0) {6};
+\node[rin] (r4) at (5,0) {};   \node[font=\scriptsize,below=0.5mm] at (5,0) {10};
+\node[rin] (r5) at (8,0) {};   \node[font=\scriptsize,below=0.5mm] at (8,0) {14};
+
+% match arrows
+\draw[mt] (l1) -- (r1);
+\draw[mt] (l2) -- (r3);
+\draw[mt] (l3) -- (r4);
+\draw[mt] (l4) -- (r4);
+
+\node[font=\scriptsize,text=accent!85,align=center] at (3.6,-1.15)
+      {each outer row takes the last inner row to its left};
+\node[font=\scriptsize,text=warn,align=center] at (8.3,1.05) {never\\reached};
+\end{tikzpicture}
+\caption{One key group. Outer timestamps $2,7,11,12$; inner $1,5,6,10,14$. The inner
+cursor moves left to right exactly once. Note that $t=5$ is absorbed and then superseded by
+$t=6$ --- it is a candidate briefly --- and that outer rows $11$ and $12$ share the
+candidate $10$ without any rewind.}
+\label{fig:merge}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}rlll@{}}
+\toprule
+\textbf{Step} & \textbf{Outer $t_L$} & \textbf{Inner absorbed} & \textbf{\code{cand} after}\\
+\midrule
+1 & 2  & 1               & 1\\
+2 & 7  & 5, then 6       & 6\\
+3 & 11 & 10              & 10\\
+4 & 12 & --- (next is 14, fails $t_R \le 12$) & 10\\
+\bottomrule
+\end{tabular}
+\caption{Trace of Figure~\ref{fig:merge}. Total inner advances: 5. A LATERAL plan would
+perform 4 independent index descents instead.}
+\end{table}
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Run the algorithm by hand on Figure~\ref{fig:merge} with the strict operator $<$.
+      Which output row changes?
+\item Modify the pseudocode for \code{ASOF JOIN} (inner). Where exactly does the change go,
+      and does Invariant~\ref{inv:cand} still hold?
+\item Suppose the outer side were \emph{not} sorted within a key. Give a three-row example
+      producing a wrong answer, illustrating the monotonicity remark.
+\item What is the peak memory of the merge pass, excluding sorts? Compare with
+      \file{nodeMergejoin.c}'s requirement when the inner side needs materialising.
+\item Why can the inner cursor safely skip past a key that the outer never visits? Which
+      line does that, and what would happen if it compared with \code{<=} instead
+      of \code{<}?
+\end{enumerate}
+
+% ============================================================
+\chapter{Making the Planner Choose It}\label{ch:planner}
+% ============================================================
+
+A correct executor node is useless if no \code{Path} leads to it. This chapter covers the
+three things the planner must learn: the required sort order, the legality constraints, and
+the cost.
+
+\section{Pathkeys: the planner's model of order}
+\label{sec:pathkeys}
+
+The merge algorithm's precondition is that both inputs arrive sorted ascending on
+$(k_1, \dots, k_j, t)$ --- \emph{equality keys first, match column last}. In planner terms
+this is a list of \code{PathKey}s, and the mechanism for obtaining it is the same one merge
+join uses:
+
+\begin{enumerate}[leftmargin=*]
+\item Build the required \code{PathKey} list for each side with the
+      \code{make\_pathkeys\_for\_sortclauses} family, using the \code{btree} opfamily
+      established during Phase~1 validation.
+\item For each candidate child \code{Path}, compare its \code{pathkeys} against the
+      requirement with \code{pathkeys\_contained\_in()}. A path whose existing order has the
+      requirement as a \emph{prefix} needs no sort.
+\item Otherwise wrap the child in \code{create\_sort\_path()}, paying the sort cost.
+\end{enumerate}
+
+\begin{keyidea}
+This step is where the performance claim is cashed. An index on
+\code{quotes (symbol, ts)} produces an \code{Index Scan} path whose pathkeys already match,
+so \emph{both} sorts disappear and the join degenerates to a pure $O(n+m)$ streaming pass
+over two index scans. Without the pathkey machinery we would sort unconditionally and give
+back much of the advantage.
+\end{keyidea}
+
+Note the ordering requirement is on $(k, t)$ with $k$ \emph{leading}: the algorithm needs
+key groups to be contiguous (remark (B) of \S\ref{sec:candidate}). An index on
+\code{(ts, symbol)} does not help, which is a useful thing to be able to explain to a user
+staring at an unexpected \code{Sort} node.
+
+\section{Path generation}
+
+\code{add\_paths\_to\_joinrel()} in \file{optimizer/path/joinpath.c} is where each join
+strategy proposes its paths. For \code{JOIN\_ASOF} the \asof{} path is the \emph{only}
+candidate:
+
+\begin{itemize}[nosep]
+\item \textbf{no hash join} --- hashing implements equality, and the match condition is an
+      inequality;
+\item \textbf{no nested loop} --- it would have to re-search per outer row, which is the
+      very thing we are replacing (and the Phase~1 rewrite already covers that plan shape);
+\item \textbf{merge-style only}, with sorts added as needed.
+\end{itemize}
+
+The path itself is created by a new \code{create\_asofjoin\_path()} in
+\file{optimizer/util/pathnode.c}, modelled closely on \code{create\_mergejoin\_path()}.
+
+\section{Why ASOF constrains join order}
+
+Property (P2) --- non-commutativity --- has teeth in the optimiser. PostgreSQL's planner
+explores join orders freely for inner joins, because
+$A \bowtie B \equiv B \bowtie A$ and
+$(A \bowtie B) \bowtie C \equiv A \bowtie (B \bowtie C)$. Outer joins already break those
+identities, and \file{optimizer/path/joinrels.c} contains the machinery that restricts
+them: \code{join\_is\_legal()} decides whether a given pair may be joined at all, and
+\code{have\_join\_order\_restriction()} tells the planner not to give up on a join order it
+would otherwise prune.
+
+\asof{} must join the same restrictions:
+
+\begin{itemize}[nosep]
+\item \textbf{Not commutable.} $L$ must remain the outer side. The identity of ``which side
+      is probed'' is part of the operator's meaning, not an implementation detail.
+\item \textbf{Not freely reassociable.} Pushing another join inside an \asof{} join can
+      change which rows exist on the inner side and therefore which row is nearest ---
+      the same hazard that makes outer-join reassociation conditional.
+\item \textbf{Qual placement.} A filter on the inner relation changes the candidate set,
+      hence the answer. It must not be pushed below the \asof{} join unless it was written
+      there, exactly as for the nullable side of an outer join.
+\end{itemize}
+
+The practical approach is to find every \code{switch (jointype)} in the optimiser and
+handle \code{JOIN\_ASOF} deliberately. Building with \code{-Wswitch} turns this from an
+exercise in grep into a compiler-enforced checklist --- a worthwhile technique in general
+when adding a variant to a widely-switched enum.
+
+\section{The cost model}
+
+PostgreSQL costs a path in two parts: \code{initial\_cost\_xxx} (cheap, used to prune) and
+\code{final\_cost\_xxx} (exact, for survivors). For \asof{}:
+
+\begin{align}
+\text{startup} &= C_{\text{sort}}(L) + C_{\text{sort}}(R) \quad\text{(either term zero if presorted)}\\
+\text{total}   &= \text{startup} + (n + m)\,c_{\text{tuple}} + n\,c_{\text{match}} + n\,c_{\text{proj}}
+\end{align}
+
+where $c_{\text{match}}$ is the cost of evaluating the match comparison and the key
+equality, and $c_{\text{proj}}$ the projection cost. Three observations:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{The sorts dominate the startup cost}, which means an \asof{} join is a poor
+      choice under a \code{LIMIT} unless the inputs are presorted --- the planner needs the
+      startup/total split to make that trade-off correctly. This is exactly the behaviour of
+      merge join, and the reason PostgreSQL models startup cost at all.
+\item \textbf{There is no rescan term.} Merge join's cost function includes an allowance for
+      re-reading inner tuples after a restore; \asof{} has none
+      (\S\ref{sec:candidate}), so the linear term is clean. Getting this right matters:
+      over-costing the join makes the planner prefer a nested loop and the whole exercise is
+      wasted.
+\item \textbf{Output cardinality is known exactly} for the left variant: $n$ rows,
+      by (P1). This is a rare luxury --- most join estimates are the product of a selectivity
+      guess --- and it makes everything above an \asof{} join easier to plan. For the inner
+      variant, estimate $n \cdot p$ where $p$ is the fraction of left rows having a
+      predecessor, which can be approximated from the two relations' histograms on $t$
+      (specifically, the fraction of $L$'s distribution lying above $\min t_R$ per key).
+\end{enumerate}
+
+\section{The GUC}
+
+\code{enable\_asofjoin} (default \code{on}) is added to
+\file{utils/misc/guc\_tables.c} and \file{postgresql.conf.sample}. Switching it
+\code{off} reverts to the Phase~1 rewrite. This is not merely a safety valve: it is the
+instrument that makes the Chapter~\ref{ch:measuring} benchmark and differential test
+possible at all, since it lets the same query text run through both implementations in the
+same session.
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Explain why \code{(ts, symbol)} is the wrong index for an \asof{} join on
+      \code{symbol} and why \code{(symbol, ts)} is right.
+\item The required pathkeys put equality keys first. Could the algorithm be reformulated to
+      allow $t$ first? What would it cost?
+\item Under what circumstances would a nested-loop \asof{} plan actually be cheaper than the
+      merge plan? Should we offer it?
+\item Why does the planner need both \code{initial\_cost} and \code{final\_cost} functions
+      rather than computing the exact cost once?
+\end{enumerate}
+
+% ============================================================
+\chapter{Correctness Corners}
+% ============================================================
+
+Most of the defect risk in a feature like this sits in a handful of corners. Each gets a
+rule and a regression test.
+
+\paragraph{NULL in the match column.} A NULL $t$ on either side makes the comparison
+\textsc{unknown}, so the row is not a candidate. In Phase~1 this falls out of the subquery's
+\code{WHERE}. In Phase~2 it must be explicit: the merge comparison has to treat NULL as
+non-matching rather than as an ordering extreme. Note the trap --- in a \emph{sort}, NULLs
+are ordered (nulls last by default for ascending), so they will arrive at the end of the
+stream and must be skipped rather than absorbed as candidates.
+
+\paragraph{NULL in a partition key.} Treated as never-equal, consistent with \code{=}. Both
+phases get this right for free if the key comparison uses the ordinary equality operator;
+the trap is using a \emph{sort} comparison instead, under which two NULLs compare equal.
+This is the one place where ``sorted together'' and ``equal'' genuinely diverge, and it is
+worth a dedicated test.
+
+\paragraph{Ties on $t_R$.} Implementation-defined, documented, and tested only to the extent
+that both phases agree. See the remark in Chapter~2.
+
+\paragraph{Empty inputs.} Empty $R$: all left rows NULL-extended (left) or no rows (inner).
+Empty $L$: no rows, and --- worth asserting --- the inner side should ideally not be read at
+all. Both are one-line tests and both have caught real bugs in similar operators.
+
+\paragraph{Strict versus non-strict operators.} The only difference is whether equal
+timestamps match. In Phase~2 this is a single comparison operator in loop~(D); getting it
+backwards produces an off-by-one-row error that is invisible unless the test data contains
+exactly-equal timestamps. The test data must therefore contain them deliberately.
+
+\paragraph{Rescan.} \code{ExecReScanAsofJoin} must reset the candidate slot, the key, and
+both children. Without the candidate reset, an \asof{} join on the inner side of a nested
+loop returns the \emph{previous} outer iteration's match on its first row --- a subtle,
+data-dependent wrong answer. Test it under a correlated subquery.
+
+\paragraph{Memory.} The candidate slot must live in a context that is reset per key group,
+or at least not leaked per tuple. A $10^7$-row query is the right smoke test: memory should
+be flat.
+
+\paragraph{Parallelism.} The node is marked parallel-unsafe initially. A single ordered pass
+over a shared inner stream does not partition trivially; the natural parallelisation is
+per-key-range, which requires a partitioned sort and is out of scope. Mark it, assert it,
+and note the follow-up.
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Construct test data in which the strict/non-strict distinction changes the result for
+      exactly one row.
+\item Why does the NULL-in-key rule require an equality operator rather than the sort
+      comparator? Write the two-row example that distinguishes them.
+\item Design the correlated-subquery test that would catch a missing candidate reset in
+      \code{ExecReScanAsofJoin}.
+\end{enumerate}
+
+% ============================================================
+\chapter{Measuring It}\label{ch:measuring}
+% ============================================================
+
+\section{Reading the plans}
+
+The three plan shapes to recognise:
+
+\begin{lstlisting}[style=plain,caption={LATERAL workaround --- per-row index descent.},captionpos=b]
+Nested Loop Left Join
+  ->  Seq Scan on trades t
+  ->  Limit
+        ->  Index Scan Backward using quotes_symbol_ts_idx on quotes q
+              Index Cond: ((symbol = t.symbol) AND (ts <= t.ts))
+\end{lstlisting}
+
+\begin{lstlisting}[style=plain,caption={Native, inputs not presorted --- two sorts, one pass.},captionpos=b]
+Asof Left Join
+  Match Condition: (t.ts >= q.ts)
+  Asof Keys: (t.symbol = q.symbol)
+  ->  Sort
+        Sort Key: t.symbol, t.ts
+        ->  Seq Scan on trades t
+  ->  Sort
+        Sort Key: q.symbol, q.ts
+        ->  Seq Scan on quotes q
+\end{lstlisting}
+
+\begin{lstlisting}[style=plain,caption={Native, indexes supply the order --- the goal.},captionpos=b]
+Asof Left Join
+  Match Condition: (t.ts >= q.ts)
+  Asof Keys: (t.symbol = q.symbol)
+  ->  Index Scan using trades_symbol_ts_idx on trades t
+  ->  Index Scan using quotes_symbol_ts_idx on quotes q
+\end{lstlisting}
+
+The presence or absence of the \code{Sort} nodes is the single most informative thing in
+these plans, and it is why \code{EXPLAIN} output is a deliverable in its own right.
+
+\section{Benchmark design}
+
+\paragraph{What to vary.} Row counts $10^5 / 10^6 / 10^7$; number of distinct keys
+($1$, $50$, $10^4$ --- key cardinality changes how much of the inner stream each outer row
+skips); index present or absent; left versus inner; match density (fraction of left rows
+with a predecessor).
+
+\paragraph{What to compare.} Three implementations on identical data: hand-written LATERAL,
+Phase~1 rewrite (expected to be \emph{identical} --- any gap is a rewrite bug, not a
+finding), and Phase~2 native with \code{enable\_asofjoin} on.
+
+\paragraph{Pitfalls.}
+\begin{itemize}[nosep]
+\item \textbf{Cold cache.} First run reads from disk; subsequent runs do not. Warm up, or
+      report both, but never mix them in one table.
+\item \textbf{Planner noise.} Run \code{ANALYZE} before timing, and check with
+      \code{EXPLAIN} that the plan is the one you think you are measuring. A benchmark that
+      silently measured a different plan is the most common way to get a wrong answer here.
+\item \textbf{\code{EXPLAIN ANALYZE} overhead.} Per-tuple instrumentation can add tens of
+      percent, and it falls more heavily on plans with more node invocations --- i.e.\
+      unfairly on the LATERAL plan. Time with \code{\textbackslash timing} for the headline
+      numbers; use \code{EXPLAIN ANALYZE} for diagnosis.
+\item \textbf{\code{work\_mem}.} The native plan's sorts spill to disk below a threshold and
+      the measurement falls off a cliff. Report the setting.
+\item \textbf{Index-only scans.} A covering index can make the LATERAL plan much faster than
+      expected. Note whether the index covers the projected columns.
+\end{itemize}
+
+\section{Differential testing}
+
+The strongest correctness tool the project has is that Phase~1 and Phase~2 compute the same
+function by entirely different means. The harness runs the whole query corpus twice ---
+\code{enable\_asofjoin = off}, then \code{on} --- and diffs. Any difference is a bug in one
+of them.
+
+\begin{lstlisting}
+-- equivalence check, per query
+SET enable_asofjoin = off;  CREATE TEMP TABLE a AS <query>;
+SET enable_asofjoin = on;   CREATE TEMP TABLE b AS <query>;
+SELECT count(*) FROM ((TABLE a EXCEPT ALL TABLE b)
+                      UNION ALL (TABLE b EXCEPT ALL TABLE a)) d;  -- must be 0
+\end{lstlisting}
+
+Extend this with randomised inputs: generated tables with random key cardinality, random
+NULL density, random tie frequency, and a randomly chosen operator. Property-based testing
+finds the corners of Chapter~7 far more reliably than hand-written cases, because it does
+not share the implementer's blind spots.
+
+\section{Exercises}
+\begin{enumerate}[leftmargin=*]
+\item Why is \code{EXCEPT ALL} in both directions necessary, rather than a single
+      \code{EXCEPT}?
+\item The equivalence check above compares multisets. How should it be amended for queries
+      whose results differ legitimately due to ties?
+\item Predict the shape of the native-versus-LATERAL speedup curve as key cardinality rises
+      from 1 to $10^4$, and justify your prediction in terms of \S\ref{sec:candidate}.
+\end{enumerate}
+
+% ============================================================
+\appendix
+\chapter{Source File Map}
+% ============================================================
+
+Every PostgreSQL file the project touches, keyed to the work plan's issue IDs
+(\file{plan.md}).
+
+\begin{table}[h]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{6.6cm}p{5.3cm}p{1.5cm}@{}}
+\toprule
+\textbf{File} & \textbf{Role} & \textbf{Issues}\\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Parser}}\\
+\file{include/parser/kwlist.h} & keyword registration & P1-A1\\
+\file{backend/parser/gram.y} & grammar productions & P1-A1/A2\\
+\file{include/nodes/primnodes.h} & \code{JoinExpr} fields & P1-A3\\
+\file{backend/parser/parse\_clause.c} & \code{transformFromClauseItem} & P1-B1\\
+\file{backend/parser/parse\_asof.c} \textit{(new)} & the LATERAL rewrite & P1-B2\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Nodes \& deparse}}\\
+\file{backend/nodes/gen\_node\_support.pl} & copy/equal/out/read generation & P1-A3, P2-C2\\
+\file{backend/utils/adt/ruleutils.c} & \code{pg\_get\_viewdef} deparse & P1-A3, P2-C2\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Planner}}\\
+\file{include/nodes/nodes.h} & \code{JOIN\_ASOF} in \code{JoinType} & P2-B1\\
+\file{backend/optimizer/path/joinrels.c} & join legality, order restrictions & P2-B1\\
+\file{backend/optimizer/path/joinpath.c} & path generation & P2-B2\\
+\file{backend/optimizer/util/pathnode.c} & \code{create\_asofjoin\_path} & P2-B2\\
+\file{backend/optimizer/path/costsize.c} & cost functions & P2-B3\\
+\file{backend/utils/misc/guc\_tables.c} & \code{enable\_asofjoin} & P2-B3\\
+\file{backend/optimizer/plan/createplan.c} & \code{create\_asofjoin\_plan} & P2-A1\\
+\file{include/nodes/plannodes.h} & \code{AsofJoin} plan node & P2-A1\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Executor}}\\
+\file{backend/executor/nodeAsofjoin.c} \textit{(new)} & the merge algorithm & P2-A2\\
+\file{include/nodes/execnodes.h} & \code{AsofJoinState} & P2-A2\\
+\file{backend/executor/execProcnode.c} & node dispatch & P2-A1\\
+\file{backend/executor/execAmi.c} & \code{ExecReScan} & P2-A3\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Surface \& tests}}\\
+\file{backend/commands/explain.c} & plan output & P2-C1\\
+\file{test/regress/sql/asof\_join.sql} & regression suite & P1-C2\\
+\file{doc/src/sgml/ref/select.sgml} & user documentation & P1-C3\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\chapter{Glossary}
+
+\begin{description}[leftmargin=*,style=nextline,font=\normalfont\bfseries\ttfamily]
+\item[Path] One candidate way of producing a relation, with cost and sort order. The
+planner enumerates paths and keeps the cheapest.
+\item[PathKey] Canonical representation of a sort order, used to decide whether a sort can
+be skipped.
+\item[RelOptInfo] Planner's record of a relation --- base or join --- and its paths.
+\item[TupleTableSlot] Holder for one tuple in the executor. Reused by the producing node,
+hence the copy requirement in \S\ref{sec:candidate}.
+\item[LATERAL] \code{FROM}-clause modifier permitting a subquery to reference earlier
+\code{FROM} items; evaluated per outer row.
+\item[Desugaring] Defining a new construct by translation into existing ones. Phase~1's
+technique.
+\item[Volcano model] Iterator-based execution: every node exposes \code{next()}, pulling
+tuples from children on demand.
+\item[Mark/restore] Merge join's mechanism for rewinding the inner side over duplicate
+keys. Not needed by \asof{} --- see \S\ref{sec:candidate}.
+\item[opfamily] Catalogued group of related operators (e.g.\ \code{btree} comparison
+operators for a type), which is how PostgreSQL knows a type has a usable total order.
+\item[GUC] ``Grand Unified Configuration'' --- a PostgreSQL run-time setting, e.g.\
+\code{enable\_asofjoin}.
+\end{description}
+
+\end{document}
