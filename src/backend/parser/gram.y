@@ -699,7 +699,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 /* ordinary key words in alphabetical order */
 %token <keyword> ABORT_P ABSENT ABSOLUTE_P ACCESS ACTION ADD_P ADMIN AFTER
 	AGGREGATE ALL ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY ARRAY AS ASC
-	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
+	ASENSITIVE ASOF ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
 
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
 	BOOLEAN_P BOTH BREADTH BY
@@ -900,7 +900,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * They wouldn't be given a precedence at all, were it not that we need
  * left-associativity among the JOIN rules themselves.
  */
-%left		JOIN CROSS LEFT FULL RIGHT INNER_P NATURAL
+%left		JOIN CROSS LEFT FULL RIGHT INNER_P NATURAL ASOF
 
 %%
 
@@ -13805,6 +13805,59 @@ joined_table:
 					n->quals = NULL; /* fill later */
 					$$ = n;
 				}
+			| table_ref ASOF JOIN table_ref ON a_expr
+				{
+					JoinExpr   *n = makeNode(JoinExpr);
+
+					n->jointype = JOIN_INNER;
+					n->isAsof = true;
+					n->isNatural = false;
+					n->larg = $1;           /* left table_ref  */
+					n->rarg = $4;           /* right table_ref */
+					n->usingClause = NIL;
+					n->join_using_alias = NULL;
+					n->quals = $6;          /* the a_expr after ON */
+					$$ = n;
+				}
+			| table_ref join_type ASOF JOIN table_ref ON a_expr
+				{
+					JoinExpr   *n = makeNode(JoinExpr);
+
+					if ($2 != JOIN_INNER && $2 != JOIN_LEFT)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("only INNER and LEFT ASOF joins are supported"),
+								 parser_errposition(@2)));
+					n->jointype = $2;
+					n->isAsof = true;
+					n->isNatural = false;
+					n->larg = $1;
+					n->rarg = $5;
+					n->usingClause = NIL;
+					n->join_using_alias = NULL;
+					n->quals = $7;
+					$$ = n;
+				}
+			| table_ref ASOF join_type JOIN table_ref ON a_expr
+				{
+					/* DuckDB-style spelling: ASOF LEFT JOIN */
+					JoinExpr   *n = makeNode(JoinExpr);
+
+					if ($3 != JOIN_INNER && $3 != JOIN_LEFT)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("only INNER and LEFT ASOF joins are supported"),
+								 parser_errposition(@3)));
+					n->jointype = $3;
+					n->isAsof = true;
+					n->isNatural = false;
+					n->larg = $1;
+					n->rarg = $5;
+					n->usingClause = NIL;
+					n->join_using_alias = NULL;
+					n->quals = $7;
+					$$ = n;
+				}
 		;
 
 alias_clause:
@@ -18102,7 +18155,8 @@ col_name_keyword:
  * - thomas 2000-11-28
  */
 type_func_name_keyword:
-			  AUTHORIZATION
+			  ASOF
+			| AUTHORIZATION
 			| BINARY
 			| COLLATION
 			| CONCURRENTLY
@@ -18243,6 +18297,7 @@ bare_label_keyword:
 			| ANY
 			| ASC
 			| ASENSITIVE
+			| ASOF
 			| ASSERTION
 			| ASSIGNMENT
 			| ASYMMETRIC

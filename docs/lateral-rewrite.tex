@@ -1,0 +1,241 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{mathpazo}
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks,colorlinks=true,linkcolor=linkblue,urlcolor=linkblue]{hyperref}
+
+\definecolor{linkblue}{HTML}{1F4E79}
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codeframe}{HTML}{D6DBE1}
+\definecolor{kw}{HTML}{A3254A}
+\definecolor{cmt}{HTML}{5A7D5A}
+\definecolor{accent}{HTML}{1F4E79}
+
+\lstdefinestyle{sqlstyle}{
+  language=SQL,
+  morekeywords={ASOF,LATERAL,OVER,RETURNING,EXPLAIN,ANALYZE},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{codeframe},
+  framesep=4pt, xleftmargin=5pt,
+  breaklines=true, showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+}
+\lstdefinestyle{cstyle}{
+  language=C,
+  morekeywords={bool,List,Node,JoinExpr,SelectStmt,RangeSubselect,ColumnRef,A_Expr,SortBy,
+                A_Const,ParseState,ListCell},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{codeframe},
+  framesep=4pt, xleftmargin=5pt,
+  breaklines=true, showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+}
+\lstset{style=sqlstyle}
+\emergencystretch=3em
+\hbadness=4000
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\file}[1]{\texttt{\footnotesize #1}}
+\newcommand{\asof}{{\normalfont\scshape asof}}
+
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+
+\title{\vspace{-2cm}\textbf{How ASOF JOIN Is Implemented}\\[0.2cm]
+       \large Phase 1: rewriting to a LATERAL join}
+\author{CS631 — ASOF JOIN project}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-0.8cm}
+
+\section{What the rewrite does}
+
+\asof{} join is implemented without touching the planner or the executor. The parser
+recognises the syntax, and the analyser rewrites the query into an equivalent
+\code{LATERAL} join that PostgreSQL already knows how to run. Everything downstream is
+untouched code.
+
+\begin{lstlisting}
+-- written by the user
+SELECT t.sym, t.ts, q.bid
+FROM trades t ASOF LEFT JOIN quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+\end{lstlisting}
+
+\begin{lstlisting}
+-- what the database actually analyses
+SELECT t.sym, t.ts, q.bid
+FROM trades t LEFT JOIN LATERAL (
+    SELECT * FROM quotes
+    WHERE quotes.sym = t.sym AND t.ts >= quotes.ts
+    ORDER BY quotes.ts DESC
+    LIMIT 1
+) q ON true;
+\end{lstlisting}
+
+\code{LATERAL} is what makes the subquery legal: it allows the subquery to reference
+\code{t}, the item to its left in the \code{FROM} clause. Semantically the subquery is
+evaluated once per row of \code{trades}, with that row's values substituted in, and
+\code{ORDER BY ... LIMIT 1} picks the single nearest match. \code{LEFT JOIN ... ON true}
+supplies the NULL-extension when no match exists; a plain \code{JOIN} drops the row
+instead, which is how \code{ASOF JOIN} and \code{ASOF LEFT JOIN} differ.
+
+\section{Where it happens, and why that choice keeps it small}
+
+PostgreSQL processes a query in stages: \textbf{parse} (text to a raw tree, no catalog
+lookups), \textbf{analyse} (resolve names and types), \textbf{rewrite} (views and rules),
+\textbf{plan}, \textbf{execute}.
+
+The rewrite is performed at the \emph{start} of analysis, in
+\file{src/backend/parser/parse\_clause.c}. \code{transformFromClauseItem()} walks the
+\code{FROM} clause; when it meets a \code{JoinExpr} with \code{isAsof} set, it calls
+\code{transformAsofToLateralJoin()} and continues with the returned tree:
+
+\begin{lstlisting}[style=cstyle]
+/* ASOF joins are executed as LATERAL joins; rewrite before analysis */
+if (j->isAsof)
+    j = transformAsofToLateralJoin(pstate, j);
+\end{lstlisting}
+
+The timing matters. Because this runs \emph{before} names are resolved, the function
+manipulates the raw parse tree — \code{ColumnRef} nodes holding strings, not \code{Var}
+nodes with resolved table and column numbers. It produces a tree identical to what the
+parser would have built had the user typed the \code{LATERAL} form by hand. Name
+resolution, type resolution, \code{LATERAL} validity checking, lateral-reference marking
+and planning then all happen afterwards in existing code that has no idea \asof{} exists.
+
+That is why Phase 1 is roughly 250 lines rather than several thousand: it is a
+source-to-source translation, the technique a compiler calls \emph{desugaring}, where a new
+construct is defined entirely by what it translates into.
+
+\section{Building the replacement tree}
+
+\subsection*{Finding the inequality}
+
+The grammar hands over the whole \code{ON} clause as one expression. The function flattens
+its top-level \code{AND} into a list of conjuncts and looks for exactly one that is an
+inequality relating the two sides:
+
+\begin{itemize}[nosep,leftmargin=*]
+\item the operator is one of \code{<}, \code{<=}, \code{>}, \code{>=};
+\item one operand is a plain column of the right-hand table;
+\item the other references columns, but none belonging to the right-hand table — so it can
+      only be evaluated against the left.
+\end{itemize}
+
+Finding two such conjuncts, or none, is an error. The remaining conjuncts — the equality
+keys and any other filters — are left alone.
+
+\subsection*{Choosing the sort direction}
+
+The operator decides which way "nearest" runs, and therefore the \code{ORDER BY}:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Condition} & \textbf{Meaning} & \textbf{Sort} \\
+\midrule
+\code{t.ts >= q.ts} & latest at or before   & \code{q.ts DESC} \\
+\code{t.ts > q.ts}  & latest strictly before & \code{q.ts DESC} \\
+\code{t.ts <= q.ts} & earliest at or after  & \code{q.ts ASC} \\
+\code{t.ts < q.ts}  & earliest strictly after & \code{q.ts ASC} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Writing the same condition with the operands swapped (\code{q.ts <= t.ts}) means the same
+thing, so the code checks both arrangements and flips the direction accordingly.
+
+\subsection*{Assembling it}
+
+The replacement is built from ordinary raw-parse-tree nodes:
+
+\begin{itemize}[nosep,leftmargin=*]
+\item a \code{SelectStmt} whose target list is \code{*}, whose \code{FROM} is the original
+      right-hand side, whose \code{WHERE} is the \emph{entire original \code{ON} clause},
+      with the \code{ORDER BY} above and \code{LIMIT 1};
+\item a \code{RangeSubselect} wrapping it with \code{lateral = true}, aliased to the name
+      the right table was already visible under — so references like \code{q.bid} elsewhere
+      in the query keep resolving;
+\item a new \code{JoinExpr} with the original join type, the original left side, that
+      subquery as its right side, and \code{ON true}.
+\end{itemize}
+
+The input tree is not modified; a new \code{JoinExpr} is returned, because callers may reuse
+raw parse trees.
+
+\section{The one subtlety: where the equality keys go}
+
+The equality keys go \emph{inside} the subquery's \code{WHERE}, together with the
+inequality. Putting them in the outer \code{ON} instead looks equivalent and is not:
+
+\begin{lstlisting}
+-- WRONG
+trades t LEFT JOIN LATERAL (
+    SELECT * FROM quotes WHERE quotes.ts <= t.ts
+    ORDER BY quotes.ts DESC LIMIT 1
+) q ON t.sym = q.sym
+\end{lstlisting}
+
+That subquery finds the latest quote \emph{of any symbol} before the trade, and the outer
+condition then rejects it if the symbol happens to differ — returning NULL even though a
+perfectly good quote for the right symbol exists. Filtering and "take the latest" do not
+commute: you must restrict the candidates \emph{before} choosing the best one, never after.
+
+This is also why PostgreSQL's optimiser could never perform this rewrite for us. Pushing a
+predicate below a \code{LIMIT} changes the result, so the planner correctly refuses to do
+it; the predicate has to be placed correctly at construction time.
+
+\section{What it costs, and what it does not do}
+
+The resulting plan is a nested loop with the subquery on the inner side:
+
+\begin{lstlisting}[style=sqlstyle]
+Nested Loop Left Join
+  ->  Seq Scan on trades t
+  ->  Limit
+        ->  Index Scan Backward using quotes_sym_ts_idx on quotes q
+              Index Cond: ((sym = t.sym) AND (ts <= t.ts))
+\end{lstlisting}
+
+With a suitable index this is one index descent per left row: $O(n \log m)$, with random
+access per probe. Without one it degrades to a sort or scan per left row, which is
+$O(n \cdot m)$. Phase 1 therefore makes \asof{} \emph{expressible}, not fast — it performs
+exactly as well as the hand-written \code{LATERAL} query, because it is that query.
+
+Making it fast is Phase 2: sort both inputs by \code{(key, time)} once and walk them
+together, keeping a single remembered row, which is $O(n + m)$ — and free of sorting
+entirely when an index already supplies the order. That plan cannot be expressed as a
+\code{LATERAL} join at any price, which is the reason to build a real operator.
+
+\subsection*{Known limitations of the current implementation}
+
+\begin{itemize}[nosep,leftmargin=*]
+\item Views store the rewritten \code{LATERAL} form, so \code{pg\_get\_viewdef} does not
+      show \asof{} syntax.
+\item Operands are classified by matching column-reference names textually, since the
+      rewrite runs before name resolution; an unqualified reference is never attributed to
+      the right-hand table.
+\item The inequality operator is not checked for a usable sort order — which Phase 2 needs.
+\item The right-hand side must be a table or an aliased subquery.
+\item The right operand of the inequality must be a bare column, so
+      \code{ON t.ts >= q.ts + interval '1 min'} is rejected.
+\item Ties on the match column resolve arbitrarily, as \code{LIMIT 1} does.
+\end{itemize}
+
+\end{document}
