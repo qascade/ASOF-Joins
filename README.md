@@ -104,10 +104,34 @@ Nested Loop Left Join
               Index Cond: ((sym = t.sym) AND (ts <= t.ts))
 ```
 
-Five runs of the 50,000 x 200,000 bulk case from `test.sql`, index present on
-`(sym, ts)`, results verified identical every run:
+#### What was measured
 
-| Run | `ASOF JOIN` | hand-written LATERAL |
+The same two queries, run against the same data, one after the other:
+
+```sql
+-- A: the new syntax
+SELECT t.tid, q.ts FROM big_trades t
+ASOF LEFT JOIN big_quotes q ON t.sym = q.sym AND t.ts >= q.ts;
+
+-- B: what people write today
+SELECT t.tid, q.ts FROM big_trades t
+LEFT JOIN LATERAL (
+    SELECT q.ts FROM big_quotes q
+    WHERE q.sym = t.sym AND q.ts <= t.ts
+    ORDER BY q.ts DESC LIMIT 1) q ON true;
+```
+
+Data is `big_trades` and `big_quotes` from `test.sql`: 50,000 trades and 200,000 quotes
+over 55 and 50 symbols respectively, so five symbols have trades but no quotes. Generated
+from a fixed seed, so every run uses identical rows. Index on `(sym, ts)` present on both
+tables, and `ANALYZE` run before timing.
+
+Each numbered run is one execution of A followed by one of B — the same pair repeated five
+times, to see how much the machine alone varies the answer. Row counts matched (50,000) and
+the two result sets were compared with `EXCEPT ALL` in both directions after every run;
+they were identical every time.
+
+| Run | A: `ASOF JOIN` | B: hand-written LATERAL |
 |---|---|---|
 | 1 | 1924.3 ms | 1873.4 ms |
 | 2 | 1870.3 ms | 1853.0 ms |
@@ -116,10 +140,16 @@ Five runs of the 50,000 x 200,000 bulk case from `test.sql`, index present on
 | 5 | 1876.7 ms | 1903.5 ms |
 | **median** | **1924.3 ms** | **1903.5 ms** |
 
-The 1% median difference is noise: the spread *within* each column is about 12%, far wider
-than the gap between them. That is the expected result, and it is worth stating as the
-measurement floor — when benchmarking the native join later, anything under roughly 10% on
-a single run means nothing.
+#### Reading the numbers
+
+A is 21 ms slower than B at the median — about 1%. That difference means nothing, because
+the same query varies more than that against itself: A's own runs range from 1870 to 2102
+ms, a spread of 232 ms. In run 3 A was slower than B, in run 4 it was faster. The machine
+alone moves the number around more than the two queries differ from each other.
+
+That is the expected and desired result: A and B are the same plan, so they should take the
+same time. It also sets a floor for later benchmarking — on this machine a single run has to
+differ by roughly 10% before it means anything at all.
 
 Measured on macOS 14.5, Apple silicon, PostgreSQL 18.6 built with
 `--enable-cassert CFLAGS='-O0 -g3'` and `work_mem = 4MB`. **Assertions make this build
