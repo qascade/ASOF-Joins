@@ -1,0 +1,116 @@
+# Enforces Conventional Commits on pull request titles, and nudges on issue titles.
+#
+# The PR title matters more than individual commit messages here: we squash-merge, so the
+# PR title becomes the commit subject on main. Format:
+#
+#     <type>(<scope>)!: <subject>
+#
+# Examples:
+#     feat(parser): add ASOF and MATCH_CONDITION keywords
+#     fix(executor): copy the candidate tuple instead of retaining the slot pointer
+#     docs: add a macOS build path to the README
+#
+# The check is an inline regex rather than a third-party action: it is a few lines, it
+# needs no extra token, and it cannot change underneath us.
+
+name: Conventional title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+
+env:
+  TYPES: 'feat|fix|docs|test|perf|refactor|build|ci|chore|revert'
+  SCOPES: 'parser|analyzer|planner|executor|explain|nodes|bench|docs|ci|build|regress'
+
+jobs:
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the pull request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "Title: $TITLE"
+          if [[ "$TITLE" =~ ^($TYPES)(\(($SCOPES)\))?!?:[[:space:]].+ ]]; then
+            echo "OK: title follows Conventional Commits."
+          else
+            echo "::error title=Invalid PR title::'$TITLE' is not a Conventional Commit. Expected <type>(<scope>): <subject>"
+            echo ""
+            echo "Expected:  <type>(<scope>)!: <subject>"
+            echo ""
+            echo "  type     feat fix docs test perf refactor build ci chore revert"
+            echo "  scope    optional: parser analyzer planner executor explain nodes"
+            echo "                     bench docs ci build regress"
+            echo "  !        optional, marks a breaking change"
+            echo "  subject  imperative mood, lower case, no trailing period"
+            echo ""
+            echo "Examples:"
+            echo "  feat(parser): add ASOF and MATCH_CONDITION keywords"
+            echo "  fix(executor): copy the candidate tuple instead of retaining the slot pointer"
+            echo "  perf(bench): record LATERAL baseline timings at 1e7 rows"
+            echo "  docs: add a macOS build path to the README"
+            echo ""
+            echo "We squash-merge, so this title becomes the commit subject on main."
+            exit 1
+          fi
+
+      - name: Check the subject line
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          SUBJECT="${TITLE#*: }"
+          status=0
+          if [[ "$SUBJECT" =~ \.$ ]]; then
+            echo "::error::Subject should not end with a period."
+            status=1
+          fi
+          if [[ "${SUBJECT:0:1}" =~ [A-Z] ]] && [[ ! "$SUBJECT" =~ ^(ASOF|SQL|CI|NULL|PG|API|GUC|TAP|EXPLAIN|LATERAL) ]]; then
+            echo "::warning::Subject normally starts lower case; acronyms such as ASOF, SQL and NULL are fine."
+          fi
+          if [ ${#TITLE} -gt 72 ]; then
+            echo "::warning::Title is ${#TITLE} characters; 72 or fewer reads better in git log."
+          fi
+          exit $status
+
+  issue-title:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Nudge if the issue title is not conventional
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ github.event.issue.title }}
+          NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [[ "$TITLE" =~ ^($TYPES)(\(($SCOPES)\))?!?:[[:space:]].+ ]]; then
+            echo "OK: $TITLE"
+            exit 0
+          fi
+          echo "::warning title=Non-conventional issue title::$TITLE"
+          # Advisory only: an awkward title should never stop anyone filing an issue.
+          # Comment once, then stay quiet on later edits.
+          if gh issue view "$NUMBER" --repo "$REPO" --json comments --jq '.comments[].body' \
+             | grep -q 'Conventional title check'; then
+            echo "Already commented; nothing to do."
+            exit 0
+          fi
+          {
+            printf '**Conventional title check** — this title is not in Conventional Commits form.\n'
+            printf 'We use it for issues too, so `gh issue list` and `git log` read the same way.\n\n'
+            printf '```\n<type>(<scope>): <subject>\n```\n\n'
+            printf '`type`: `feat` `fix` `docs` `test` `perf` `refactor` `build` `ci` `chore` `revert`\n\n'
+            printf '`scope` (optional): `parser` `analyzer` `planner` `executor` `explain` `nodes` `bench` `docs` `ci` `build` `regress`\n\n'
+            printf 'For example `feat(planner): add JOIN_ASOF join type and plan plumbing`.\n'
+            printf 'This is advisory — nothing is blocked, just rename when convenient.\n'
+          } > comment.md
+          gh issue comment "$NUMBER" --repo "$REPO" --body-file comment.md

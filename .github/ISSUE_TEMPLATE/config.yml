@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Study guide
+    url: https://github.com/qascade/ASOF-Joins/blob/main/docs/asof-join.pdf
+    about: How ASOF join works, both phases, the algorithms and the file map. Read before asking.
+  - name: Work plan
+    url: https://github.com/qascade/ASOF-Joins/blob/main/plan.md
+    about: Phase breakdown, who owns which layer, and the issue list with acceptance criteria.
