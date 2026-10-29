@@ -68,6 +68,87 @@ psql test
 
 Run `. ./pgenv.sh` in every new terminal before using any PostgreSQL commands.
 
+## ASOF JOIN
+
+This fork adds an `ASOF JOIN`, which matches each left row to the nearest right row by
+time instead of by equality — the latest quote at or before each trade, per symbol.
+
+```sql
+SELECT t.sym, t.ts, q.bid
+FROM trades t ASOF LEFT JOIN quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+```
+
+The `ON` clause holds the usual equality keys plus **exactly one** inequality
+(`>=`, `>`, `<=` or `<`) between a column of the right table and an expression over the
+left. That inequality decides which direction "nearest" means. `ASOF LEFT JOIN` keeps left
+rows with no match and fills the right columns with NULL; `ASOF JOIN` drops them.
+
+Today it is implemented by rewriting the query into an equivalent
+`LEFT JOIN LATERAL (... ORDER BY ts DESC LIMIT 1)` during parse analysis, so it performs
+exactly like the hand-written form. Phase 2 adds a native sort-merge join and a setting to
+choose between the two. See `docs/lateral-rewrite.pdf` for how the rewrite works, and
+`docs/asof-join.pdf` for the operator itself.
+
+### Performance today
+
+Phase 1 is a rewrite, not a new algorithm, so it performs **exactly** like the hand-written
+LATERAL query — the planner receives the same tree and produces the same plan. Both forms
+of the bulk query produce byte-identical plans:
+
+```
+Nested Loop Left Join
+  ->  Seq Scan on big_trades t
+  ->  Limit
+        ->  Index Only Scan Backward using big_quotes_sym_ts on big_quotes q
+              Index Cond: ((sym = t.sym) AND (ts <= t.ts))
+```
+
+Five runs of the 50,000 x 200,000 bulk case from `test.sql`, index present on
+`(sym, ts)`, results verified identical every run:
+
+| Run | `ASOF JOIN` | hand-written LATERAL |
+|---|---|---|
+| 1 | 1924.3 ms | 1873.4 ms |
+| 2 | 1870.3 ms | 1853.0 ms |
+| 3 | 2101.7 ms | 1951.8 ms |
+| 4 | 1935.0 ms | 2037.2 ms |
+| 5 | 1876.7 ms | 1903.5 ms |
+| **median** | **1924.3 ms** | **1903.5 ms** |
+
+The 1% median difference is noise: the spread *within* each column is about 12%, far wider
+than the gap between them. That is the expected result, and it is worth stating as the
+measurement floor — when benchmarking the native join later, anything under roughly 10% on
+a single run means nothing.
+
+Measured on macOS 14.5, Apple silicon, PostgreSQL 18.6 built with
+`--enable-cassert CFLAGS='-O0 -g3'` and `work_mem = 4MB`. **Assertions make this build
+several times slower than a release build**; both sides are affected equally, so the
+comparison holds, but the absolute numbers are not representative. Reproduce with
+`psql -X -f test.sql`, which prints `debug_assertions` and `work_mem` before the timings for
+exactly this reason.
+
+Phase 2 replaces the per-row index search with a single sorted pass over both inputs, which
+is where an actual speedup comes from — most of all when no suitable index exists, since
+the plan above then degrades to a sort per left row.
+
+### Testing it
+
+`test.sql` is a self-checking harness: it runs each ASOF query alongside an equivalent
+hand-written LATERAL query and prints PASS or FAIL per case.
+
+```bash
+. ./pgenv.sh
+createdb asoftest
+psql -d asoftest -X -f test.sql
+```
+
+It covers all four inequality directions, left and inner, other key and time types, empty
+inputs, and a 50k x 200k bulk case that also reports timings. Data is seeded, so rows and
+diffs are identical on every run. Timings are only comparable against runs with the same
+build and settings, which is why the script prints `debug_assertions` and `work_mem` first
+— an assertions-enabled build is several times slower.
+
 ## Run the tests
 
 ```bash

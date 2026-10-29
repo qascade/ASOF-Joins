@@ -18,6 +18,15 @@
 \set ON_ERROR_STOP on
 \pset footer off
 
+-- An assertions build is several times slower; timings only compare
+-- against runs with the same settings.
+\echo '--- environment'
+SELECT version() AS version;
+SELECT current_setting('debug_assertions') AS debug_assertions,
+       current_setting('work_mem')         AS work_mem;
+
+CREATE TEMP TABLE bench_timings (test text, impl text, ms numeric);
+
 DROP TABLE IF EXISTS trades, quotes, big_trades, big_quotes,
                      sensor_reads, calib, events_tz, rates_tz CASCADE;
 
@@ -264,18 +273,31 @@ DROP TABLE r_asof, r_ref;
 CREATE INDEX big_quotes_sym_ts ON big_quotes (sym, ts);
 CREATE INDEX big_trades_sym_ts ON big_trades (sym, ts);
 ANALYZE big_quotes; ANALYZE big_trades;
-\timing on
+-- warm the cache; the first run measures disk, not the join
+CREATE TEMP TABLE r_warm AS
+SELECT t.tid FROM big_trades t ASOF LEFT JOIN big_quotes q
+     ON t.sym = q.sym AND t.ts >= q.ts;                                -- <ASOF>
+DROP TABLE r_warm;
+
+SELECT clock_timestamp() AS t0 \gset
 CREATE TEMP TABLE r_asof AS
 SELECT t.tid, q.ts AS q_ts
 FROM big_trades t ASOF LEFT JOIN big_quotes q
      ON t.sym = q.sym AND t.ts >= q.ts;                                -- <ASOF>
+INSERT INTO bench_timings
+SELECT 'T8 bulk with index', 'asof',
+       round(extract(epoch FROM clock_timestamp() - :'t0'::timestamptz) * 1000, 1);
+
+SELECT clock_timestamp() AS t0 \gset
 CREATE TEMP TABLE r_ref AS
 SELECT t.tid, q.ts AS q_ts
 FROM big_trades t LEFT JOIN LATERAL (
     SELECT q.ts FROM big_quotes q
     WHERE q.sym = t.sym AND q.ts <= t.ts
     ORDER BY q.ts DESC LIMIT 1) q ON true;
-\timing off
+INSERT INTO bench_timings
+SELECT 'T8 bulk with index', 'lateral',
+       round(extract(epoch FROM clock_timestamp() - :'t0'::timestamptz) * 1000, 1);
 SELECT 'T8 bulk with index' AS test,
        CASE WHEN (SELECT count(*) FROM (TABLE r_asof EXCEPT ALL TABLE r_ref) a) = 0
              AND (SELECT count(*) FROM (TABLE r_ref EXCEPT ALL TABLE r_asof) b) = 0
@@ -307,3 +329,6 @@ EXPLAIN (COSTS OFF)
 SELECT t.tid, q.bid
 FROM big_trades t ASOF LEFT JOIN big_quotes q
      ON t.sym = q.sym AND t.ts >= q.ts;                                -- <ASOF>
+
+\echo '--- timings (same build and settings only)'
+SELECT test, impl, ms FROM bench_timings ORDER BY test, impl;
