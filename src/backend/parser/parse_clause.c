@@ -29,6 +29,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/cost.h"
 #include "parser/analyze.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
@@ -1421,7 +1422,7 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		int			k;
 
 		/* ASOF joins are executed as LATERAL joins; rewrite before analysis */
-		if (j->isAsof)
+		if (j->isAsof && !enable_asofjoin_native)
 			j = transformAsofToLateralJoin(pstate, j);
 
 		/*
@@ -1657,6 +1658,9 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		{
 			/* User-written ON-condition; transform it */
 			j->quals = transformJoinOnClause(pstate, j, my_namespace);
+			if (j->isAsof)
+				j->jointype = (j->jointype == JOIN_LEFT) ? 
+								JOIN_ASOF_LEFT : JOIN_ASOF_INNER;
 		}
 		else
 		{
@@ -1694,6 +1698,15 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 				break;
 			case JOIN_RIGHT:
 				markRelsAsNulledBy(pstate, j->larg, j->rtindex);
+				break;
+			case JOIN_ASOF_INNER:
+				/*
+				* The RHS is never actually null-extended, but the ASOF match is
+				* selection-sensitive: quals above the join must not be pushed into
+				* the RHS.  Marking it nulled is what keeps them above the join.
+				*/
+			case JOIN_ASOF_LEFT:
+				markRelsAsNulledBy(pstate, j->rarg, j->rtindex);
 				break;
 			default:
 				/* shouldn't see any other types here */

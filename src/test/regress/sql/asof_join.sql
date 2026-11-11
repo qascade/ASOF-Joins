@@ -6,6 +6,8 @@
 -- rewriting it into a LATERAL subquery with ORDER BY ... LIMIT 1.
 --
 
+SET enable_asofjoin_native = off;
+
 CREATE TABLE asof_trades (sym text, ts int, qty int);
 CREATE TABLE asof_quotes (sym text, ts int, price int);
 INSERT INTO asof_trades VALUES

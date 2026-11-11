@@ -910,6 +910,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_asofjoin_native", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of asof join plans."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_asofjoin_native,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_mergejoin", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of merge join plans."),
 			NULL,
