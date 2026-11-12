@@ -5623,6 +5623,14 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 			nrows = outer_rows * (1.0 - fkselec * jselec);
 			nrows *= pselec;
 			break;
+		case JOIN_ASOF_LEFT:
+			/* every left row appears exactly once, matched or not */
+			nrows = outer_rows * pselec;
+			break;
+		case JOIN_ASOF_INNER:
+			/* only left rows that found a match, like a semijoin */
+			nrows = outer_rows * fkselec * jselec * pselec;
+			break;
 		default:
 			/* other values not expected here */
 			elog(ERROR, "unrecognized join type: %d", (int) jointype);

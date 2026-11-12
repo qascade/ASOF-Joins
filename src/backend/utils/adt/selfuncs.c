@@ -2384,10 +2384,11 @@ eqjoinsel(PG_FUNCTION_ARGS)
 			break;
 		case JOIN_SEMI:
 		case JOIN_ANTI:
-
+		case JOIN_ASOF_LEFT:
+		case JOIN_ASOF_INNER:
 			/*
 			 * Look up the join's inner relation.  min_righthand is sufficient
-			 * information because neither SEMI nor ANTI joins permit any
+			 * information because neither SEMI, ANTI nor ASOF joins permit any
 			 * reassociation into or out of their RHS, so the righthand will
 			 * always be exactly that set of rels.
 			 */
