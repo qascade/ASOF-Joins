@@ -126,6 +126,19 @@ SELECT * FROM asof_trades t ASOF JOIN asof_quotes q USING (sym);
 SELECT * FROM asof_trades t ASOF JOIN (SELECT 1 AS ts) ON t.ts >= 1;
 SELECT * FROM asof_trades q ASOF JOIN asof_quotes q ON q.ts >= q.ts;
 
+-- the native path checks the transformed ON clause for one match inequality
+SET enable_asofjoin_native = on;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.sym = q.sym;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= q.ts AND t.qty < q.price;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON q.ts >= 3;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts <> q.ts;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= q.ts + random()::int;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
+SET enable_asofjoin_native = off;
+
 -- asof is a keyword now, but still usable as a quoted name or column label
 SELECT 1 AS asof, 2 asof;
 CREATE TABLE "asof" (x int);

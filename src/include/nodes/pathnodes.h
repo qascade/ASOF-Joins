@@ -3036,7 +3036,7 @@ struct SpecialJoinInfo
 	Relids		min_righthand;	/* base+OJ relids in minimum RHS for join */
 	Relids		syn_lefthand;	/* base+OJ relids syntactically within LHS */
 	Relids		syn_righthand;	/* base+OJ relids syntactically within RHS */
-	JoinType	jointype;		/* always INNER, LEFT, FULL, SEMI, or ANTI */
+	JoinType	jointype;		/* INNER, LEFT, FULL, SEMI, ANTI or ASOF_* */
 	Index		ojrelid;		/* outer join's RT index; 0 if none */
 	Relids		commute_above_l;	/* commuting OJs above this one, if LHS */
 	Relids		commute_above_r;	/* commuting OJs above this one, if RHS */
@@ -3048,6 +3048,9 @@ struct SpecialJoinInfo
 	bool		semi_can_hash;	/* true if semi_operators are all hash */
 	List	   *semi_operators; /* OIDs of equality join operators */
 	List	   *semi_rhs_exprs; /* righthand-side expressions of these ops */
+	/* Remaining field is set only for JOIN_ASOF_LEFT/JOIN_ASOF_INNER: */
+	RestrictInfo *asof_clause;	/* the match inequality, which is kept out
+								 * of the join's ordinary clauses */
 };
 
 /*

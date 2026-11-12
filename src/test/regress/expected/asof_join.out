@@ -258,6 +258,41 @@ SELECT * FROM asof_trades q ASOF JOIN asof_quotes q ON q.ts >= q.ts;
 ERROR:  ASOF JOIN condition must contain an inequality between a column of "q" and the left side
 LINE 1: ...T * FROM asof_trades q ASOF JOIN asof_quotes q ON q.ts >= q....
                                                              ^
+-- the native path checks the transformed ON clause for one match inequality
+SET enable_asofjoin_native = on;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.sym = q.sym;
+ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+LINE 1: ...T * FROM asof_trades t ASOF JOIN asof_quotes q ON t.sym = q....
+                                                             ^
+HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= q.ts AND t.qty < q.price;
+ERROR:  ASOF JOIN condition must contain exactly one inequality between the joined relations
+LINE 2:   ON t.ts >= q.ts AND t.qty < q.price;
+                              ^
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON q.ts >= 3;
+ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+LINE 1: ...T * FROM asof_trades t ASOF JOIN asof_quotes q ON q.ts >= 3;
+                                                             ^
+HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts <> q.ts;
+ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+LINE 1: ...T * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts <> q....
+                                                             ^
+HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= q.ts + random()::int;
+ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+LINE 2:   ON t.ts >= q.ts + random()::int;
+             ^
+HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
+ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+LINE 2:   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q....
+             ^
+HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+SET enable_asofjoin_native = off;
 -- asof is a keyword now, but still usable as a quoted name or column label
 SELECT 1 AS asof, 2 asof;
  asof | asof 

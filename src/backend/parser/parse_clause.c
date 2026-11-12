@@ -71,6 +71,7 @@ static TableSampleClause *transformRangeTableSample(ParseState *pstate,
 static ParseNamespaceItem *getNSItemForSpecialRelationTypes(ParseState *pstate,
 															RangeVar *rv);
 static JoinExpr *transformAsofToLateralJoin(ParseState *pstate, JoinExpr *j);
+static void checkAsofMatchClause(ParseState *pstate, JoinExpr *j);
 static Node *transformFromClauseItem(ParseState *pstate, Node *n,
 									 ParseNamespaceItem **top_nsitem,
 									 List **namespace);
@@ -1103,6 +1104,72 @@ asofIsLeftOnly(Node *expr, const char *relname)
 }
 
 /*
+ * Collect the RT indexes of the relations and joins in a jointree subtree.
+ */
+static Bitmapset *
+asofJoinTreeRelids(Node *jtnode)
+{
+	Bitmapset  *result = NULL;
+
+	if (jtnode == NULL)
+		return NULL;
+	if (IsA(jtnode, RangeTblRef))
+		result = bms_make_singleton(((RangeTblRef *) jtnode)->rtindex);
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jtnode;
+
+		result = bms_union(asofJoinTreeRelids(j->larg),
+						   asofJoinTreeRelids(j->rarg));
+		if (j->rtindex)
+			result = bms_add_member(result, j->rtindex);
+	}
+	else if (IsA(jtnode, FromExpr))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((FromExpr *) jtnode)->fromlist)
+			result = bms_join(result, asofJoinTreeRelids(lfirst(lc)));
+	}
+	else
+		elog(ERROR, "unrecognized node type: %d", (int) nodeTag(jtnode));
+	return result;
+}
+
+/*
+ * checkAsofMatchClause -
+ *	  Verify that the transformed ON clause of a native ASOF join contains
+ *	  exactly one match inequality.
+ *
+ * The match inequality is a <, <=, > or >= comparison between an
+ * expression of the right input and an expression of the left input.  The
+ * planner finds it again with the same rules (find_asof_match_clauses) and
+ * treats it specially; every other conjunct is an ordinary join condition.
+ */
+static void
+checkAsofMatchClause(ParseState *pstate, JoinExpr *j)
+{
+	List	   *matches;
+
+	matches = find_asof_match_clauses(NULL,
+									  make_ands_implicit((Expr *) j->quals),
+									  asofJoinTreeRelids(j->larg),
+									  asofJoinTreeRelids(j->rarg));
+
+	if (matches == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("ASOF JOIN condition must contain an inequality between the joined relations"),
+				 errhint("Add a condition such as \"left.ts >= right.ts\" to the ON clause."),
+				 parser_errposition(pstate, exprLocation(j->quals))));
+	if (list_length(matches) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("ASOF JOIN condition must contain exactly one inequality between the joined relations"),
+				 parser_errposition(pstate, exprLocation(lsecond(matches)))));
+}
+
+/*
  * transformAsofToLateralJoin -
  *	  Rewrite the raw parse tree of an ASOF join into an equivalent LATERAL
  *	  join, before any semantic analysis is done on it.
@@ -1659,8 +1726,11 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 			/* User-written ON-condition; transform it */
 			j->quals = transformJoinOnClause(pstate, j, my_namespace);
 			if (j->isAsof)
-				j->jointype = (j->jointype == JOIN_LEFT) ? 
-								JOIN_ASOF_LEFT : JOIN_ASOF_INNER;
+			{
+				j->jointype = (j->jointype == JOIN_LEFT) ?
+					JOIN_ASOF_LEFT : JOIN_ASOF_INNER;
+				checkAsofMatchClause(pstate, j);
+			}
 		}
 		else
 		{
