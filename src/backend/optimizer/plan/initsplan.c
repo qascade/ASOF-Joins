@@ -1329,6 +1329,8 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 				break;
 			case JOIN_LEFT:
 			case JOIN_ANTI:
+			case JOIN_ASOF_LEFT:
+			case JOIN_ASOF_INNER:
 				/* Make new join domain for my quals and the RHS */
 				child_domain = makeNode(JoinDomain);
 				child_domain->jd_relids = NULL; /* filled by recursion */
@@ -1810,8 +1812,9 @@ make_outerjoininfo(PlannerInfo *root,
 
 	compute_semijoin_info(root, sjinfo, clause);
 
-	/* If it's a full join, no need to be very smart */
-	if (jointype == JOIN_FULL)
+	/* FULL and ASOF joins can't be reordered, so no need to be smart */
+	if (jointype == JOIN_FULL || jointype == JOIN_ASOF_LEFT ||
+		jointype == JOIN_ASOF_INNER)
 	{
 		sjinfo->min_lefthand = bms_copy(left_rels);
 		sjinfo->min_righthand = bms_copy(right_rels);
@@ -1873,7 +1876,9 @@ make_outerjoininfo(PlannerInfo *root,
 		 * out of it.  Hence, if it overlaps either LHS or RHS of the current
 		 * rel, expand that side's min relset to cover the whole full join.
 		 */
-		if (otherinfo->jointype == JOIN_FULL)
+		if (otherinfo->jointype == JOIN_FULL ||
+			otherinfo->jointype == JOIN_ASOF_LEFT ||
+			otherinfo->jointype == JOIN_ASOF_INNER)
 		{
 			Assert(otherinfo->ojrelid != 0);
 			if (bms_overlap(left_rels, otherinfo->syn_lefthand) ||
