@@ -1630,6 +1630,14 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
 													ojscope,
 													NULL,	/* incompatible_relids */
 													jtitem->nonnullable_rels);
+
+			/* The join needs the match columns, so make the inputs emit them */
+			add_vars_to_targetlist(root,
+								   pull_var_clause((Node *) match,
+												   PVC_RECURSE_AGGREGATES |
+												   PVC_RECURSE_WINDOWFUNCS |
+												   PVC_INCLUDE_PLACEHOLDERS),
+								   sjinfo->asof_clause->required_relids);
 		}
 
 		/*
@@ -3650,6 +3658,19 @@ rebuild_joinclause_attr_needed(PlannerInfo *root)
 				list_free(vars);
 			}
 		}
+	}
+
+	/* ASOF match clauses are not in any joininfo list, so do them here */
+	foreach_node(SpecialJoinInfo, sjinfo, root->join_info_list)
+	{
+		if (sjinfo->asof_clause == NULL)
+			continue;
+		add_vars_to_attr_needed(root,
+								pull_var_clause((Node *) sjinfo->asof_clause->clause,
+												PVC_RECURSE_AGGREGATES |
+												PVC_RECURSE_WINDOWFUNCS |
+												PVC_INCLUDE_PLACEHOLDERS),
+								sjinfo->asof_clause->required_relids);
 	}
 }
 
