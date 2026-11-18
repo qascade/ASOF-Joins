@@ -1429,6 +1429,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			pname = "Hash";		/* "Join" gets added by jointype switch */
 			sname = "Hash Join";
 			break;
+		case T_AsofJoin:
+			pname = "Asof";		/* "Join" gets added by jointype switch */
+			sname = "Asof Join";
+			break;
 		case T_SeqScan:
 			pname = sname = "Seq Scan";
 			break;
@@ -1712,6 +1716,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
+		case T_AsofJoin:
 			{
 				const char *jointype;
 
@@ -1741,6 +1746,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					case JOIN_RIGHT_ANTI:
 						jointype = "Right Anti";
 						break;
+					case JOIN_ASOF_INNER:
+						jointype = "Inner";
+						break;
+					case JOIN_ASOF_LEFT:
+						jointype = "Left";
+						break;
 					default:
 						jointype = "???";
 						break;
@@ -1751,7 +1762,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					 * For historical reasons, the join type is interpolated
 					 * into the node type name...
 					 */
-					if (((Join *) plan)->jointype != JOIN_INNER)
+					if (((Join *) plan)->jointype != JOIN_INNER &&
+						((Join *) plan)->jointype != JOIN_ASOF_INNER)
 						appendStringInfo(es->str, " %s Join", jointype);
 					else if (!IsA(plan, NestLoop))
 						appendStringInfoString(es->str, " Join");
@@ -1939,6 +1951,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
+		case T_AsofJoin:
 			/* try not to be too chatty about this in text mode */
 			if (es->format != EXPLAIN_FORMAT_TEXT ||
 				(es->verbose && ((Join *) plan)->inner_unique))
@@ -2178,6 +2191,15 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 2,
 										   planstate, es);
+			break;
+		case T_AsofJoin:
+			show_upper_qual(((AsofJoin *) plan)->mergeclauses,
+							"Merge Cond", planstate, ancestors, es);
+			show_upper_qual(list_make1(((AsofJoin *) plan)->asofclause),
+							"Asof Cond", planstate, ancestors, es);
+			show_upper_qual(((AsofJoin *) plan)->join.joinqual,
+							"Join Filter", planstate, ancestors, es);
+			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
 			break;
 		case T_HashJoin:
 			show_upper_qual(((HashJoin *) plan)->hashclauses,
