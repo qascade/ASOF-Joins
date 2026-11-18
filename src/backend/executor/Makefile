@@ -34,6 +34,7 @@ OBJS = \
 	instrument.o \
 	nodeAgg.o \
 	nodeAppend.o \
+	nodeAsofjoin.o \
 	nodeBitmapAnd.o \
 	nodeBitmapHeapscan.o \
 	nodeBitmapIndexscan.o \

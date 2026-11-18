@@ -2170,6 +2170,17 @@ typedef struct NestLoopState
 } NestLoopState;
 
 /* ----------------
+ *	 AsofJoinState information
+ *
+ *		Nothing extra yet: the ASOF join executor is not written.
+ * ----------------
+ */
+typedef struct AsofJoinState
+{
+	JoinState	js;				/* its first field is NodeTag */
+} AsofJoinState;
+
+/* ----------------
  *	 MergeJoinState information
  *
  *		NumClauses		   number of mergejoinable join clauses

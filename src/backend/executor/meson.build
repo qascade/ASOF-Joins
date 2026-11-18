@@ -22,6 +22,7 @@ backend_sources += files(
   'instrument.c',
   'nodeAgg.c',
   'nodeAppend.c',
+  'nodeAsofjoin.c',
   'nodeBitmapAnd.c',
   'nodeBitmapHeapscan.c',
   'nodeBitmapIndexscan.c',
