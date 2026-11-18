@@ -856,6 +856,7 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
+		case T_AsofJoin:
 			set_join_references(root, (Join *) plan, rtoffset);
 			break;
 
@@ -2401,6 +2402,31 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 										 rtoffset,
 										 NRM_EQUAL,
 										 NUM_EXEC_QUAL((Plan *) join));
+	}
+	else if (IsA(join, AsofJoin))
+	{
+		AsofJoin   *aj = (AsofJoin *) join;
+		List	   *asofclause;
+
+		aj->mergeclauses = fix_join_expr(root,
+										 aj->mergeclauses,
+										 outer_itlist,
+										 inner_itlist,
+										 (Index) 0,
+										 rtoffset,
+										 NRM_EQUAL,
+										 NUM_EXEC_QUAL((Plan *) join));
+
+		/* fix_join_expr works on a list, so wrap the single clause */
+		asofclause = fix_join_expr(root,
+								   list_make1(aj->asofclause),
+								   outer_itlist,
+								   inner_itlist,
+								   (Index) 0,
+								   rtoffset,
+								   NRM_EQUAL,
+								   NUM_EXEC_QUAL((Plan *) join));
+		aj->asofclause = (Expr *) linitial(asofclause);
 	}
 	else if (IsA(join, HashJoin))
 	{
