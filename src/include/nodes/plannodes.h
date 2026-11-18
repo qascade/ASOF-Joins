@@ -956,23 +956,25 @@ typedef struct NestLoopParam
 /* ----------------
  *		asof join node
  *
- * Both inputs arrive sorted on the equality keys followed by the match
- * expression.  For each outer row the executor returns the nearest inner
- * row that satisfies asofclause (and joinqual), or a null-extended row
- * for LEFT ASOF.
+ * Both inputs are sorted on the equality keys, then the match column.
+ * For each outer row we return the closest inner row that passes
+ * asofclause and joinqual (or a NULL row for LEFT ASOF).
  * ----------------
  */
 typedef struct AsofJoin
 {
 	Join		join;
-	/* equality clauses, outer expression on the left */
-	List	   *mergeclauses;
-	/* the match inequality, outer expression on the left */
-	Expr	   *asofclause;
-	/* is the match expression sorted descending (for < and <=)? */
-	bool		asof_descending;
-	/* < or > rather than <= or >= */
-	bool		asof_strict;
+	List	   *mergeclauses;	/* equality keys, outer side on the left */
+
+	/* sort info for each merge clause, same as in MergeJoin */
+	Oid		   *mergeFamilies pg_node_attr(array_size(mergeclauses));
+	Oid		   *mergeCollations pg_node_attr(array_size(mergeclauses));
+	bool	   *mergeReversals pg_node_attr(array_size(mergeclauses));
+	bool	   *mergeNullsFirst pg_node_attr(array_size(mergeclauses));
+
+	Expr	   *asofclause;		/* match inequality, outer side on the left */
+	bool		asof_descending;	/* match column sorted DESC (< and <=) */
+	bool		asof_strict;	/* < or > instead of <= or >= */
 } AsofJoin;
 
 /* ----------------
