@@ -292,6 +292,114 @@ ERROR:  ASOF JOIN condition must contain an inequality between the joined relati
 LINE 2:   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q....
              ^
 HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+-- native plans: both inputs sorted on the equality keys, then the match column
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+              QUERY PLAN               
+---------------------------------------
+ Asof Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   ->  Sort
+         Sort Key: t.sym, t.ts
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.sym, q.ts
+         ->  Seq Scan on asof_quotes q
+(9 rows)
+
+-- < and <= sort the match column descending
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Asof Left Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts < q.ts)
+   ->  Sort
+         Sort Key: t.sym, t.ts DESC NULLS LAST
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.sym, q.ts DESC NULLS LAST
+         ->  Seq Scan on asof_quotes q
+(9 rows)
+
+-- no equality key
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts >= q.ts;
+              QUERY PLAN               
+---------------------------------------
+ Asof Join
+   Asof Cond: (t.ts >= q.ts)
+   ->  Sort
+         Sort Key: t.ts
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.ts
+         ->  Seq Scan on asof_quotes q
+(8 rows)
+
+-- match clause written right side first is shown left side first
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND q.ts <= t.ts;
+              QUERY PLAN               
+---------------------------------------
+ Asof Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   ->  Sort
+         Sort Key: t.sym, t.ts
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.sym, q.ts
+         ->  Seq Scan on asof_quotes q
+(9 rows)
+
+-- other ON quals filter candidates (Join Filter), WHERE quals filter results
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100
+WHERE q.price IS NULL;
+                QUERY PLAN                
+------------------------------------------
+ Asof Left Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   Join Filter: ((t.qty + q.price) > 100)
+   Filter: (q.price IS NULL)
+   ->  Sort
+         Sort Key: t.sym, t.ts
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.sym, q.ts
+         ->  Seq Scan on asof_quotes q
+(11 rows)
+
+-- the match column is kept even when it is not selected
+EXPLAIN (COSTS OFF)
+SELECT t.qty, q.price FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+              QUERY PLAN               
+---------------------------------------
+ Asof Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   ->  Sort
+         Sort Key: t.sym, t.ts
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.sym, q.ts
+         ->  Seq Scan on asof_quotes q
+(9 rows)
+
+-- the executor is not written yet
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+ERROR:  ASOF JOIN executor is not implemented yet
+HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
 SET enable_asofjoin_native = off;
 -- asof is a keyword now, but still usable as a quoted name or column label
 SELECT 1 AS asof, 2 asof;

@@ -137,6 +137,35 @@ SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= q.ts + random()::int;
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
+
+-- native plans: both inputs sorted on the equality keys, then the match column
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+-- < and <= sort the match column descending
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts;
+-- no equality key
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts >= q.ts;
+-- match clause written right side first is shown left side first
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND q.ts <= t.ts;
+-- other ON quals filter candidates (Join Filter), WHERE quals filter results
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100
+WHERE q.price IS NULL;
+-- the match column is kept even when it is not selected
+EXPLAIN (COSTS OFF)
+SELECT t.qty, q.price FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+
+-- the executor is not written yet
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
 SET enable_asofjoin_native = off;
 
 -- asof is a keyword now, but still usable as a quoted name or column label
