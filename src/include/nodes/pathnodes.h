@@ -2228,6 +2228,32 @@ typedef struct NestPath
 } NestPath;
 
 /*
+ * AsofJoinPath represents an ASOF join: sort both inputs on the equality
+ * keys followed by the match expression, then merge.
+ *
+ * path_mergeclauses are the equality join clauses, in sort-key order.
+ * asof_clause is the match inequality, taken from the SpecialJoinInfo.  It
+ * is not in jpath.joinrestrictinfo; the non-pushed-down clauses that are in
+ * there (other than the merge clauses) narrow the candidate inner rows
+ * before the nearest one is picked.  asof_descending and asof_strict
+ * describe the comparison with the outer expression on the left.
+ * outersortkeys/innersortkeys end with the match expression's pathkey
+ * (unless it is redundant).
+ */
+typedef struct AsofJoinPath
+{
+	JoinPath	jpath;
+	List	   *path_mergeclauses;	/* equality clauses used for merging */
+	struct RestrictInfo *asof_clause;	/* the match inequality */
+	bool		asof_outer_is_left; /* outer input's expr is the clause's
+									 * left operand? */
+	bool		asof_descending;	/* sort match expr descending? */
+	bool		asof_strict;	/* < or > rather than <= or >= */
+	List	   *outersortkeys;	/* pathkeys for the outer Sort */
+	List	   *innersortkeys;	/* pathkeys for the inner Sort */
+} AsofJoinPath;
+
+/*
  * A mergejoin path has these fields.
  *
  * Unlike other path types, a MergePath node doesn't represent just a single

@@ -954,6 +954,28 @@ typedef struct NestLoopParam
 } NestLoopParam;
 
 /* ----------------
+ *		asof join node
+ *
+ * Both inputs arrive sorted on the equality keys followed by the match
+ * expression.  For each outer row the executor returns the nearest inner
+ * row that satisfies asofclause (and joinqual), or a null-extended row
+ * for LEFT ASOF.
+ * ----------------
+ */
+typedef struct AsofJoin
+{
+	Join		join;
+	/* equality clauses, outer expression on the left */
+	List	   *mergeclauses;
+	/* the match inequality, outer expression on the left */
+	Expr	   *asofclause;
+	/* is the match expression sorted descending (for < and <=)? */
+	bool		asof_descending;
+	/* < or > rather than <= or >= */
+	bool		asof_strict;
+} AsofJoin;
+
+/* ----------------
  *		merge join node
  *
  * The expected ordering of each mergeable column is described by a btree

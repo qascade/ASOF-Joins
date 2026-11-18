@@ -182,6 +182,23 @@ extern MergePath *create_mergejoin_path(PlannerInfo *root,
 										List *innersortkeys,
 										int outer_presorted_keys);
 
+extern AsofJoinPath *create_asofjoin_path(PlannerInfo *root,
+										  RelOptInfo *joinrel,
+										  JoinType jointype,
+										  SpecialJoinInfo *sjinfo,
+										  Path *outer_path,
+										  Path *inner_path,
+										  List *restrict_clauses,
+										  List *pathkeys,
+										  Relids required_outer,
+										  List *mergeclauses,
+										  RestrictInfo *asof_clause,
+										  bool asof_outer_is_left,
+										  bool asof_descending,
+										  bool asof_strict,
+										  List *outersortkeys,
+										  List *innersortkeys);
+
 extern HashPath *create_hashjoin_path(PlannerInfo *root,
 									  RelOptInfo *joinrel,
 									  JoinType jointype,
