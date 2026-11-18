@@ -2865,6 +2865,15 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 							  &context);
 			break;
 
+		case T_AsofJoin:
+			finalize_primnode((Node *) ((Join *) plan)->joinqual,
+							  &context);
+			finalize_primnode((Node *) ((AsofJoin *) plan)->mergeclauses,
+							  &context);
+			finalize_primnode((Node *) ((AsofJoin *) plan)->asofclause,
+							  &context);
+			break;
+
 		case T_HashJoin:
 			finalize_primnode((Node *) ((Join *) plan)->joinqual,
 							  &context);
