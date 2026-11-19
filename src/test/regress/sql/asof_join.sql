@@ -2,8 +2,10 @@
 -- ASOF JOIN
 --
 -- An ASOF join matches each left row with the single nearest right row
--- that satisfies the inequality in its ON clause.  It is implemented by
--- rewriting it into a LATERAL subquery with ORDER BY ... LIMIT 1.
+-- that satisfies the inequality in its ON clause.  With
+-- enable_asofjoin_native off, it is rewritten into a LATERAL subquery
+-- with ORDER BY ... LIMIT 1; with it on, the planner builds an AsofJoin
+-- node over sorted inputs.
 --
 
 SET enable_asofjoin_native = off;
