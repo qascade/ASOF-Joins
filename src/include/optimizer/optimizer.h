@@ -145,6 +145,10 @@ extern bool contain_volatile_functions(Node *clause);
 extern bool contain_volatile_functions_after_planning(Expr *expr);
 extern bool contain_volatile_functions_not_nextval(Node *clause);
 
+extern List *find_asof_match_clauses(PlannerInfo *root, List *quals,
+									 Bitmapset *left_relids,
+									 Bitmapset *right_relids);
+
 extern Node *eval_const_expressions(PlannerInfo *root, Node *node);
 
 extern void convert_saop_to_hashed_saop(Node *node);

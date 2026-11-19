@@ -16,6 +16,7 @@
 
 #include <math.h>
 
+#include "catalog/pg_am.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "nodes/nodeFuncs.h"
@@ -95,6 +96,13 @@ static void generate_mergejoin_paths(PlannerInfo *root,
 									 Path *inner_cheapest_total,
 									 List *merge_pathkeys,
 									 bool is_partial);
+static void add_asofjoin_path(PlannerInfo *root,
+							  RelOptInfo *joinrel,
+							  RelOptInfo *outerrel,
+							  RelOptInfo *innerrel,
+							  JoinType jointype,
+							  SpecialJoinInfo *sjinfo,
+							  List *restrictlist);
 
 
 /*
@@ -133,6 +141,19 @@ add_paths_to_joinrel(PlannerInfo *root,
 	bool		mergejoin_allowed = true;
 	ListCell   *lc;
 	Relids		joinrelids;
+
+	/*
+	 * ASOF joins have exactly one implementation: sort both inputs and
+	 * merge.  The match inequality is not in restrictlist (it lives in
+	 * sjinfo->asof_clause), so the generic join methods would silently
+	 * ignore it.  Never let them see an ASOF join.
+	 */
+	if (jointype == JOIN_ASOF_INNER || jointype == JOIN_ASOF_LEFT)
+	{
+		add_asofjoin_path(root, joinrel, outerrel, innerrel,
+						  jointype, sjinfo, restrictlist);
+		return;
+	}
 
 	/*
 	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
@@ -2612,4 +2633,250 @@ select_mergejoin_clauses(PlannerInfo *root,
 	}
 
 	return result_list;
+}
+
+/*
+ * asof_match_opfamilies
+ *	  Find the btree opfamilies in which the ASOF match operator is an
+ *	  ordering operator (<, <=, > or >=) and both input types can be sorted.
+ *
+ * Returns the list of such opfamilies (empty if there is none); *opfamily
+ * and *cmptype describe the first one, which is the one we sort by.
+ */
+static List *
+asof_match_opfamilies(Oid opno, Oid lefttype, Oid righttype,
+					  Oid *opfamily, CompareType *cmptype)
+{
+	List	   *result = NIL;
+	List	   *interps = get_op_index_interpretation(opno);
+	ListCell   *lc;
+
+	foreach(lc, interps)
+	{
+		OpIndexInterpretation *interp = (OpIndexInterpretation *) lfirst(lc);
+
+		if (get_opfamily_method(interp->opfamily_id) != BTREE_AM_OID)
+			continue;
+		if (interp->cmptype != COMPARE_LT && interp->cmptype != COMPARE_LE &&
+			interp->cmptype != COMPARE_GT && interp->cmptype != COMPARE_GE)
+			continue;
+		/* each input is sorted on its own type, so both need a "<" */
+		if (!OidIsValid(get_opfamily_member_for_cmptype(interp->opfamily_id,
+														lefttype, lefttype,
+														COMPARE_LT)) ||
+			!OidIsValid(get_opfamily_member_for_cmptype(interp->opfamily_id,
+														righttype, righttype,
+														COMPARE_LT)))
+			continue;
+
+		if (result == NIL)
+		{
+			*opfamily = interp->opfamily_id;
+			*cmptype = interp->cmptype;
+		}
+		result = lappend_oid(result, interp->opfamily_id);
+	}
+
+	return result;
+}
+
+/*
+ * append_asof_pathkey
+ *	  Add the match expression's pathkey after the equality keys.
+ *
+ * A pathkey list must not name the same EquivalenceClass twice, and a
+ * pathkey whose EC contains a constant is useless for sorting.  In either
+ * case that side is already ordered on the match expression within each
+ * group of equal keys, so we simply leave the pathkey out.
+ */
+static List *
+append_asof_pathkey(List *pathkeys, PathKey *pathkey)
+{
+	ListCell   *lc;
+
+	if (EC_MUST_BE_REDUNDANT(pathkey->pk_eclass))
+		return pathkeys;
+	foreach(lc, pathkeys)
+	{
+		if (((PathKey *) lfirst(lc))->pk_eclass == pathkey->pk_eclass)
+			return pathkeys;
+	}
+	return lappend(list_copy(pathkeys), pathkey);
+}
+
+/*
+ * add_asofjoin_path
+ *	  Build the only path an ASOF join can have: sort both inputs on the
+ *	  equality keys followed by the match expression, then merge.
+ *
+ * The match inequality comes from sjinfo->asof_clause; restrictlist holds
+ * the equality keys and any other quals.  outerrel is always the ASOF
+ * join's left input (see populate_joinrel_with_paths).
+ *
+ * For now both inputs are always sorted, even if they are already in the
+ * right order.  XXX: skip a sort when the input's pathkeys already match.
+ */
+static void
+add_asofjoin_path(PlannerInfo *root,
+				  RelOptInfo *joinrel,
+				  RelOptInfo *outerrel,
+				  RelOptInfo *innerrel,
+				  JoinType jointype,
+				  SpecialJoinInfo *sjinfo,
+				  List *restrictlist)
+{
+	RestrictInfo *asof_clause = sjinfo->asof_clause;
+	Path	   *outer_path = outerrel->cheapest_total_path;
+	Path	   *inner_path = innerrel->cheapest_total_path;
+	Relids		required_outer;
+	List	   *mergeclause_list;
+	bool		mergejoin_allowed;
+	List	   *mergeclauses;
+	List	   *outerkeys;
+	List	   *innerkeys;
+	List	   *merge_pathkeys;
+	OpExpr	   *op;
+	bool		outer_is_left;
+	Expr	   *outer_expr;
+	Expr	   *inner_expr;
+	Oid			lefttype;
+	Oid			righttype;
+	Oid			outer_type;
+	Oid			inner_type;
+	List	   *opfamilies;
+	Oid			opfamily = InvalidOid;
+	CompareType cmptype = COMPARE_INVALID;
+	bool		descending;
+	bool		strict;
+	EquivalenceClass *ec;
+
+	Assert(asof_clause != NULL);
+	Assert(bms_is_subset(sjinfo->min_lefthand, outerrel->relids) &&
+		   bms_is_subset(sjinfo->min_righthand, innerrel->relids));
+
+	/*
+	 * A merge reads each input independently, so neither side may need
+	 * values from the other (as a LATERAL reference to the left side would).
+	 */
+	if (PATH_PARAM_BY_REL(outer_path, innerrel) ||
+		PATH_PARAM_BY_REL(inner_path, outerrel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the right side of ASOF JOIN cannot refer to its left side"),
+				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+	required_outer = calc_non_nestloop_required_outer(outer_path, inner_path);
+
+	/*
+	 * Equality keys.  This is what sort_inner_and_outer does for a merge
+	 * join, with a single ordering of the keys.
+	 */
+	mergeclause_list = select_mergejoin_clauses(root, joinrel,
+												outerrel, innerrel,
+												restrictlist, jointype,
+												&mergejoin_allowed);
+	outerkeys = select_outer_pathkeys_for_merge(root, mergeclause_list,
+												joinrel);
+	mergeclauses = find_mergeclauses_for_outer_pathkeys(root, outerkeys,
+														mergeclause_list);
+	Assert(list_length(mergeclauses) == list_length(mergeclause_list));
+	innerkeys = make_inner_pathkeys_for_merge(root, mergeclauses, outerkeys);
+
+	/*
+	 * The match clause: find which operand belongs to which input, and
+	 * rewrite the comparison as "outer_expr op inner_expr".
+	 */
+	op = castNode(OpExpr, asof_clause->clause);
+	outer_is_left = bms_is_subset(asof_clause->left_relids, outerrel->relids);
+	Assert(outer_is_left ?
+		   bms_is_subset(asof_clause->right_relids, innerrel->relids) :
+		   (bms_is_subset(asof_clause->left_relids, innerrel->relids) &&
+			bms_is_subset(asof_clause->right_relids, outerrel->relids)));
+	op_input_types(op->opno, &lefttype, &righttype);
+	if (outer_is_left)
+	{
+		outer_expr = (Expr *) linitial(op->args);
+		inner_expr = (Expr *) lsecond(op->args);
+		outer_type = lefttype;
+		inner_type = righttype;
+	}
+	else
+	{
+		outer_expr = (Expr *) lsecond(op->args);
+		inner_expr = (Expr *) linitial(op->args);
+		outer_type = righttype;
+		inner_type = lefttype;
+	}
+
+	opfamilies = asof_match_opfamilies(op->opno, lefttype, righttype,
+									   &opfamily, &cmptype);
+	if (opfamilies == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("could not find a sort order for the ASOF JOIN match condition"),
+				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+
+	/* "inner op outer" is "outer commuted-op inner" */
+	if (!outer_is_left)
+	{
+		switch (cmptype)
+		{
+			case COMPARE_LT:
+				cmptype = COMPARE_GT;
+				break;
+			case COMPARE_LE:
+				cmptype = COMPARE_GE;
+				break;
+			case COMPARE_GT:
+				cmptype = COMPARE_LT;
+				break;
+			case COMPARE_GE:
+				cmptype = COMPARE_LE;
+				break;
+			default:
+				elog(ERROR, "unexpected ASOF comparison type: %d", (int) cmptype);
+		}
+	}
+
+	/*
+	 * "outer >= inner" asks for the largest qualifying inner value, so both
+	 * sides are sorted ascending; "outer <= inner" asks for the smallest, so
+	 * both are sorted descending.  Either way the executor scans forward.
+	 * NULLs go last since they never match.
+	 */
+	descending = (cmptype == COMPARE_LT || cmptype == COMPARE_LE);
+	strict = (cmptype == COMPARE_LT || cmptype == COMPARE_GT);
+
+	ec = get_eclass_for_sort_expr(root, outer_expr, opfamilies, outer_type,
+								  op->inputcollid, 0, NULL, true);
+	outerkeys = append_asof_pathkey(outerkeys,
+									make_canonical_pathkey(root, ec, opfamily,
+														   descending ? COMPARE_GT : COMPARE_LT,
+														   false));
+	ec = get_eclass_for_sort_expr(root, inner_expr, opfamilies, inner_type,
+								  op->inputcollid, 0, NULL, true);
+	innerkeys = append_asof_pathkey(innerkeys,
+									make_canonical_pathkey(root, ec, opfamily,
+														   descending ? COMPARE_GT : COMPARE_LT,
+														   false));
+
+	/* The output comes out in the outer input's order */
+	merge_pathkeys = build_join_pathkeys(root, joinrel, jointype, outerkeys);
+
+	add_path(joinrel, (Path *)
+			 create_asofjoin_path(root,
+								  joinrel,
+								  jointype,
+								  sjinfo,
+								  outer_path,
+								  inner_path,
+								  restrictlist,
+								  merge_pathkeys,
+								  required_outer,
+								  mergeclauses,
+								  asof_clause,
+								  outer_is_left,
+								  descending,
+								  strict,
+								  outerkeys,
+								  innerkeys));
 }

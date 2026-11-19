@@ -60,6 +60,7 @@ extern PGDLLIMPORT bool enable_hashagg;
 extern PGDLLIMPORT bool enable_nestloop;
 extern PGDLLIMPORT bool enable_material;
 extern PGDLLIMPORT bool enable_memoize;
+extern PGDLLIMPORT bool enable_asofjoin_native;
 extern PGDLLIMPORT bool enable_mergejoin;
 extern PGDLLIMPORT bool enable_hashjoin;
 extern PGDLLIMPORT bool enable_gathermerge;
@@ -165,6 +166,7 @@ extern void initial_cost_mergejoin(PlannerInfo *root,
 extern void final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 								 JoinCostWorkspace *workspace,
 								 JoinPathExtraData *extra);
+extern void cost_asofjoin(PlannerInfo *root, AsofJoinPath *path);
 extern void initial_cost_hashjoin(PlannerInfo *root,
 								  JoinCostWorkspace *workspace,
 								  JoinType jointype,

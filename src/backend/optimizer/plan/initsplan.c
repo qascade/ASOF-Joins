@@ -1329,6 +1329,8 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 				break;
 			case JOIN_LEFT:
 			case JOIN_ANTI:
+			case JOIN_ASOF_LEFT:
+			case JOIN_ASOF_INNER:
 				/* Make new join domain for my quals and the RHS */
 				child_domain = makeNode(JoinDomain);
 				child_domain->jd_relids = NULL; /* filled by recursion */
@@ -1593,6 +1595,52 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
 		}
 
 		/*
+		 * For an ASOF join, take the match inequality out of the quals before
+		 * distributing them.  It is not an ordinary join condition: the join
+		 * keeps only the single nearest RHS row that satisfies it, so no
+		 * other join method may apply it as a filter.  The ASOF join path
+		 * picks it up from the SpecialJoinInfo.  The parser has already
+		 * checked that there is exactly one, but pulling up subqueries or
+		 * folding constants can change its shape (for instance, a RHS
+		 * column replaced by a constant), so check again.
+		 */
+		if (j->jointype == JOIN_ASOF_LEFT || j->jointype == JOIN_ASOF_INNER)
+		{
+			List	   *matches;
+			Expr	   *match;
+
+			matches = find_asof_match_clauses(root, (List *) j->quals,
+											  jtitem->left_rels,
+											  jtitem->right_rels);
+			if (list_length(matches) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("could not identify the match condition of ASOF JOIN"),
+						 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+			match = (Expr *) linitial(matches);
+
+			my_quals = list_delete_ptr(my_quals, match);
+			sjinfo->asof_clause = make_restrictinfo(root,
+													match,
+													false,	/* is_pushed_down */
+													false,	/* has_clone */
+													false,	/* is_clone */
+													false,	/* pseudoconstant */
+													root->qual_security_level,
+													ojscope,
+													NULL,	/* incompatible_relids */
+													jtitem->nonnullable_rels);
+
+			/* The join needs the match columns, so make the inputs emit them */
+			add_vars_to_targetlist(root,
+								   pull_var_clause((Node *) match,
+												   PVC_RECURSE_AGGREGATES |
+												   PVC_RECURSE_WINDOWFUNCS |
+												   PVC_INCLUDE_PLACEHOLDERS),
+								   sjinfo->asof_clause->required_relids);
+		}
+
+		/*
 		 * If it's a left join with a join clause that is strict for the LHS,
 		 * then we need to postpone handling of any non-degenerate join
 		 * clauses, in case the join is able to commute with another left join
@@ -1810,8 +1858,9 @@ make_outerjoininfo(PlannerInfo *root,
 
 	compute_semijoin_info(root, sjinfo, clause);
 
-	/* If it's a full join, no need to be very smart */
-	if (jointype == JOIN_FULL)
+	/* FULL and ASOF joins can't be reordered, so no need to be smart */
+	if (jointype == JOIN_FULL || jointype == JOIN_ASOF_LEFT ||
+		jointype == JOIN_ASOF_INNER)
 	{
 		sjinfo->min_lefthand = bms_copy(left_rels);
 		sjinfo->min_righthand = bms_copy(right_rels);
@@ -1873,7 +1922,9 @@ make_outerjoininfo(PlannerInfo *root,
 		 * out of it.  Hence, if it overlaps either LHS or RHS of the current
 		 * rel, expand that side's min relset to cover the whole full join.
 		 */
-		if (otherinfo->jointype == JOIN_FULL)
+		if (otherinfo->jointype == JOIN_FULL ||
+			otherinfo->jointype == JOIN_ASOF_LEFT ||
+			otherinfo->jointype == JOIN_ASOF_INNER)
 		{
 			Assert(otherinfo->ojrelid != 0);
 			if (bms_overlap(left_rels, otherinfo->syn_lefthand) ||
@@ -3607,6 +3658,19 @@ rebuild_joinclause_attr_needed(PlannerInfo *root)
 				list_free(vars);
 			}
 		}
+	}
+
+	/* ASOF match clauses are not in any joininfo list, so do them here */
+	foreach_node(SpecialJoinInfo, sjinfo, root->join_info_list)
+	{
+		if (sjinfo->asof_clause == NULL)
+			continue;
+		add_vars_to_attr_needed(root,
+								pull_var_clause((Node *) sjinfo->asof_clause->clause,
+												PVC_RECURSE_AGGREGATES |
+												PVC_RECURSE_WINDOWFUNCS |
+												PVC_INCLUDE_PLACEHOLDERS),
+								sjinfo->asof_clause->required_relids);
 	}
 }
 

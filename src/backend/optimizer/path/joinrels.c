@@ -967,6 +967,34 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 								 JOIN_INNER, sjinfo,
 								 restrictlist);
 			break;
+		case JOIN_ASOF_INNER:
+			/* Nothing can match if either input is empty or a qual is false */
+			if (is_dummy_rel(rel1) || is_dummy_rel(rel2) ||
+				restriction_is_constant_false(restrictlist, joinrel, false))
+			{
+				mark_dummy_rel(joinrel);
+				break;
+			}
+			add_paths_to_joinrel(root, joinrel, rel1, rel2,
+								 JOIN_ASOF_INNER, sjinfo,
+								 restrictlist);
+			break;
+		case JOIN_ASOF_LEFT:
+			/* Like LEFT JOIN: only an empty LHS or a false filter empties it */
+			if (is_dummy_rel(rel1) ||
+				restriction_is_constant_false(restrictlist, joinrel, true))
+			{
+				mark_dummy_rel(joinrel);
+				break;
+			}
+			/* A false ON clause means no RHS row can ever match */
+			if (restriction_is_constant_false(restrictlist, joinrel, false) &&
+				bms_is_subset(rel2->relids, sjinfo->syn_righthand))
+				mark_dummy_rel(rel2);
+			add_paths_to_joinrel(root, joinrel, rel1, rel2,
+								 JOIN_ASOF_LEFT, sjinfo,
+								 restrictlist);
+			break;
 		case JOIN_LEFT:
 			if (is_dummy_rel(rel1) ||
 				restriction_is_constant_false(restrictlist, joinrel, true))
@@ -1483,6 +1511,14 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 
 	/* Nothing to do, if the join relation is not partitioned. */
 	if (joinrel->part_scheme == NULL || joinrel->nparts == 0)
+		return;
+
+	/*
+	 * ASOF joins are not done partitionwise: build_child_join_sjinfo does not
+	 * translate the SpecialJoinInfo's asof_clause for the child joins.
+	 */
+	if (parent_sjinfo->jointype == JOIN_ASOF_INNER ||
+		parent_sjinfo->jointype == JOIN_ASOF_LEFT)
 		return;
 
 	/* The join relation should have consider_partitionwise_join set. */

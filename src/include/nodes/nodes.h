@@ -325,6 +325,9 @@ typedef enum JoinType
 	/*
 	 * We might need additional join types someday.
 	 */
+
+	JOIN_ASOF_LEFT,
+	JOIN_ASOF_INNER
 } JoinType;
 
 /*
@@ -347,7 +350,9 @@ typedef enum JoinType
 	   (1 << JOIN_FULL) | \
 	   (1 << JOIN_RIGHT) | \
 	   (1 << JOIN_ANTI) | \
-	   (1 << JOIN_RIGHT_ANTI))) != 0)
+	   (1 << JOIN_RIGHT_ANTI) | \
+	   (1 << JOIN_ASOF_INNER) | \
+	   (1 << JOIN_ASOF_LEFT))) != 0)
 
 /*
  * AggStrategy -

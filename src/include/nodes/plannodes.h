@@ -954,6 +954,30 @@ typedef struct NestLoopParam
 } NestLoopParam;
 
 /* ----------------
+ *		asof join node
+ *
+ * Both inputs are sorted on the equality keys, then the match column.
+ * For each outer row we return the closest inner row that passes
+ * asofclause and joinqual (or a NULL row for LEFT ASOF).
+ * ----------------
+ */
+typedef struct AsofJoin
+{
+	Join		join;
+	List	   *mergeclauses;	/* equality keys, outer side on the left */
+
+	/* sort info for each merge clause, same as in MergeJoin */
+	Oid		   *mergeFamilies pg_node_attr(array_size(mergeclauses));
+	Oid		   *mergeCollations pg_node_attr(array_size(mergeclauses));
+	bool	   *mergeReversals pg_node_attr(array_size(mergeclauses));
+	bool	   *mergeNullsFirst pg_node_attr(array_size(mergeclauses));
+
+	Expr	   *asofclause;		/* match inequality, outer side on the left */
+	bool		asof_descending;	/* match column sorted DESC (< and <=) */
+	bool		asof_strict;	/* < or > instead of <= or >= */
+} AsofJoin;
+
+/* ----------------
  *		merge join node
  *
  * The expected ordering of each mergeable column is described by a btree

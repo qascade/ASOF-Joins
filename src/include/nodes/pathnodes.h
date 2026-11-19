@@ -2228,6 +2228,32 @@ typedef struct NestPath
 } NestPath;
 
 /*
+ * AsofJoinPath represents an ASOF join: sort both inputs on the equality
+ * keys followed by the match expression, then merge.
+ *
+ * path_mergeclauses are the equality join clauses, in sort-key order.
+ * asof_clause is the match inequality, taken from the SpecialJoinInfo.  It
+ * is not in jpath.joinrestrictinfo; the non-pushed-down clauses that are in
+ * there (other than the merge clauses) narrow the candidate inner rows
+ * before the nearest one is picked.  asof_descending and asof_strict
+ * describe the comparison with the outer expression on the left.
+ * outersortkeys/innersortkeys end with the match expression's pathkey
+ * (unless it is redundant).
+ */
+typedef struct AsofJoinPath
+{
+	JoinPath	jpath;
+	List	   *path_mergeclauses;	/* equality clauses used for merging */
+	struct RestrictInfo *asof_clause;	/* the match inequality */
+	bool		asof_outer_is_left; /* outer input's expr is the clause's
+									 * left operand? */
+	bool		asof_descending;	/* sort match expr descending? */
+	bool		asof_strict;	/* < or > rather than <= or >= */
+	List	   *outersortkeys;	/* pathkeys for the outer Sort */
+	List	   *innersortkeys;	/* pathkeys for the inner Sort */
+} AsofJoinPath;
+
+/*
  * A mergejoin path has these fields.
  *
  * Unlike other path types, a MergePath node doesn't represent just a single
@@ -3036,7 +3062,7 @@ struct SpecialJoinInfo
 	Relids		min_righthand;	/* base+OJ relids in minimum RHS for join */
 	Relids		syn_lefthand;	/* base+OJ relids syntactically within LHS */
 	Relids		syn_righthand;	/* base+OJ relids syntactically within RHS */
-	JoinType	jointype;		/* always INNER, LEFT, FULL, SEMI, or ANTI */
+	JoinType	jointype;		/* INNER, LEFT, FULL, SEMI, ANTI or ASOF_* */
 	Index		ojrelid;		/* outer join's RT index; 0 if none */
 	Relids		commute_above_l;	/* commuting OJs above this one, if LHS */
 	Relids		commute_above_r;	/* commuting OJs above this one, if RHS */
@@ -3048,6 +3074,9 @@ struct SpecialJoinInfo
 	bool		semi_can_hash;	/* true if semi_operators are all hash */
 	List	   *semi_operators; /* OIDs of equality join operators */
 	List	   *semi_rhs_exprs; /* righthand-side expressions of these ops */
+	/* Remaining field is set only for JOIN_ASOF_LEFT/JOIN_ASOF_INNER: */
+	RestrictInfo *asof_clause;	/* the match inequality, which is kept out
+								 * of the join's ordinary clauses */
 };
 
 /*

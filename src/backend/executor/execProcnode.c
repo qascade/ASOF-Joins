@@ -75,6 +75,7 @@
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeAppend.h"
+#include "executor/nodeAsofjoin.h"
 #include "executor/nodeBitmapAnd.h"
 #include "executor/nodeBitmapHeapscan.h"
 #include "executor/nodeBitmapIndexscan.h"
@@ -302,6 +303,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_MergeJoin:
 			result = (PlanState *) ExecInitMergeJoin((MergeJoin *) node,
 													 estate, eflags);
+			break;
+
+		case T_AsofJoin:
+			result = (PlanState *) ExecInitAsofJoin((AsofJoin *) node,
+													estate, eflags);
 			break;
 
 		case T_HashJoin:
@@ -693,6 +699,10 @@ ExecEndNode(PlanState *node)
 
 		case T_MergeJoinState:
 			ExecEndMergeJoin((MergeJoinState *) node);
+			break;
+
+		case T_AsofJoinState:
+			ExecEndAsofJoin((AsofJoinState *) node);
 			break;
 
 		case T_HashJoinState:

@@ -153,6 +153,7 @@ bool		enable_hashagg = true;
 bool		enable_nestloop = true;
 bool		enable_material = true;
 bool		enable_memoize = true;
+bool		enable_asofjoin_native = true;
 bool		enable_mergejoin = true;
 bool		enable_hashjoin = true;
 bool		enable_gathermerge = true;
@@ -3517,6 +3518,97 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 }
 
 /*
+ * cost_asofjoin
+ *	  Determines and sets the costs of an ASOF join path.
+ *
+ * Both inputs are sorted (or used as is, when a side's sort keys are NIL)
+ * and then read once, in step.  For each outer row the executor may have
+ * to back up through inner candidates until one passes the remaining join
+ * quals; we approximate that as one candidate per outer row.
+ */
+void
+cost_asofjoin(PlannerInfo *root, AsofJoinPath *path)
+{
+	Path	   *outer_path = path->jpath.outerjoinpath;
+	Path	   *inner_path = path->jpath.innerjoinpath;
+	double		outer_rows = outer_path->rows;
+	double		inner_rows = inner_path->rows;
+	int			disabled_nodes = 0;
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	QualCost	merge_qual_cost;
+	QualCost	asof_qual_cost;
+	QualCost	qp_qual_cost;
+	Path		sort_path;
+
+	/* Outer input, sorted if needed */
+	if (path->outersortkeys)
+	{
+		cost_sort(&sort_path, root, path->outersortkeys,
+				  outer_path->disabled_nodes, outer_path->total_cost,
+				  outer_rows, outer_path->pathtarget->width,
+				  0.0, work_mem, -1.0);
+		disabled_nodes += sort_path.disabled_nodes;
+		startup_cost += sort_path.startup_cost;
+		run_cost += sort_path.total_cost - sort_path.startup_cost;
+	}
+	else
+	{
+		disabled_nodes += outer_path->disabled_nodes;
+		startup_cost += outer_path->startup_cost;
+		run_cost += outer_path->total_cost - outer_path->startup_cost;
+	}
+
+	/* Inner input, sorted if needed */
+	if (path->innersortkeys)
+	{
+		cost_sort(&sort_path, root, path->innersortkeys,
+				  inner_path->disabled_nodes, inner_path->total_cost,
+				  inner_rows, inner_path->pathtarget->width,
+				  0.0, work_mem, -1.0);
+		disabled_nodes += sort_path.disabled_nodes;
+		startup_cost += sort_path.startup_cost;
+		run_cost += sort_path.total_cost - sort_path.startup_cost;
+	}
+	else
+	{
+		disabled_nodes += inner_path->disabled_nodes;
+		startup_cost += inner_path->startup_cost;
+		run_cost += inner_path->total_cost - inner_path->startup_cost;
+	}
+
+	/*
+	 * One pass over both inputs.  Each step evaluates the equality keys and
+	 * the match clause, costed by their actual expressions.
+	 */
+	cost_qual_eval(&merge_qual_cost, path->path_mergeclauses, root);
+	cost_qual_eval_node(&asof_qual_cost, (Node *) path->asof_clause, root);
+	startup_cost += merge_qual_cost.startup + asof_qual_cost.startup;
+	run_cost += (merge_qual_cost.per_tuple + asof_qual_cost.per_tuple) *
+		(outer_rows + inner_rows);
+
+	/*
+	 * Remaining quals (joinqual and pushed-down filters), as in
+	 * final_cost_mergejoin: everything in joinrestrictinfo minus the merge
+	 * clauses.  About one candidate per outer row.
+	 */
+	cost_qual_eval(&qp_qual_cost, path->jpath.joinrestrictinfo, root);
+	qp_qual_cost.startup -= merge_qual_cost.startup;
+	qp_qual_cost.per_tuple -= merge_qual_cost.per_tuple;
+	startup_cost += qp_qual_cost.startup;
+	run_cost += qp_qual_cost.per_tuple * outer_rows;
+
+	/* Emitting the result */
+	startup_cost += path->jpath.path.pathtarget->cost.startup;
+	run_cost += (cpu_tuple_cost + path->jpath.path.pathtarget->cost.per_tuple) *
+		path->jpath.path.rows;
+
+	path->jpath.path.disabled_nodes = disabled_nodes;
+	path->jpath.path.startup_cost = startup_cost;
+	path->jpath.path.total_cost = startup_cost + run_cost;
+}
+
+/*
  * initial_cost_mergejoin
  *	  Preliminary estimate of the cost of a mergejoin path.
  *
@@ -5621,6 +5713,14 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 		case JOIN_ANTI:
 			nrows = outer_rows * (1.0 - fkselec * jselec);
 			nrows *= pselec;
+			break;
+		case JOIN_ASOF_LEFT:
+			/* every left row appears exactly once, matched or not */
+			nrows = outer_rows * pselec;
+			break;
+		case JOIN_ASOF_INNER:
+			/* only left rows that found a match, like a semijoin */
+			nrows = outer_rows * fkselec * jselec * pselec;
 			break;
 		default:
 			/* other values not expected here */

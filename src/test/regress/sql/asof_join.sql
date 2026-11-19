@@ -2,9 +2,13 @@
 -- ASOF JOIN
 --
 -- An ASOF join matches each left row with the single nearest right row
--- that satisfies the inequality in its ON clause.  It is implemented by
--- rewriting it into a LATERAL subquery with ORDER BY ... LIMIT 1.
+-- that satisfies the inequality in its ON clause.  With
+-- enable_asofjoin_native off, it is rewritten into a LATERAL subquery
+-- with ORDER BY ... LIMIT 1; with it on, the planner builds an AsofJoin
+-- node over sorted inputs.
 --
+
+SET enable_asofjoin_native = off;
 
 CREATE TABLE asof_trades (sym text, ts int, qty int);
 CREATE TABLE asof_quotes (sym text, ts int, price int);
@@ -123,6 +127,48 @@ SELECT * FROM asof_trades t ASOF FULL JOIN asof_quotes q ON t.ts >= q.ts;
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q USING (sym);
 SELECT * FROM asof_trades t ASOF JOIN (SELECT 1 AS ts) ON t.ts >= 1;
 SELECT * FROM asof_trades q ASOF JOIN asof_quotes q ON q.ts >= q.ts;
+
+-- the native path checks the transformed ON clause for one match inequality
+SET enable_asofjoin_native = on;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.sym = q.sym;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= q.ts AND t.qty < q.price;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON q.ts >= 3;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts <> q.ts;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= q.ts + random()::int;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
+
+-- native plans: both inputs sorted on the equality keys, then the match column
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+-- < and <= sort the match column descending
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts;
+-- no equality key
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts >= q.ts;
+-- match clause written right side first is shown left side first
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND q.ts <= t.ts;
+-- other ON quals filter candidates (Join Filter), WHERE quals filter results
+EXPLAIN (COSTS OFF)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100
+WHERE q.price IS NULL;
+-- the match column is kept even when it is not selected
+EXPLAIN (COSTS OFF)
+SELECT t.qty, q.price FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+
+-- the executor is not written yet
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+SET enable_asofjoin_native = off;
 
 -- asof is a keyword now, but still usable as a quoted name or column label
 SELECT 1 AS asof, 2 asof;

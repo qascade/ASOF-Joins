@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
@@ -5887,4 +5888,89 @@ make_SAOP_expr(Oid oper, Node *leftexpr, Oid coltype, Oid arraycollid,
 	saopexpr->location = -1;
 
 	return saopexpr;
+}
+
+/*
+ * is_btree_ordering_op
+ *		Is opno one of <, <=, >, >= in some btree opfamily?
+ *
+ * Only such operators can drive an ASOF match, because the inputs are
+ * sorted with the same btree opfamily.
+ */
+static bool
+is_btree_ordering_op(Oid opno)
+{
+	List	   *interps = get_op_index_interpretation(opno);
+	ListCell   *lc;
+
+	foreach(lc, interps)
+	{
+		OpIndexInterpretation *interp = (OpIndexInterpretation *) lfirst(lc);
+
+		if (get_opfamily_method(interp->opfamily_id) != BTREE_AM_OID)
+			continue;
+		if (interp->cmptype == COMPARE_LT || interp->cmptype == COMPARE_LE ||
+			interp->cmptype == COMPARE_GT || interp->cmptype == COMPARE_GE)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * find_asof_match_clauses
+ *		Return the conjuncts of an ASOF join's ON clause that could serve as
+ *		its match condition.
+ *
+ * "quals" is an implicitly-ANDed list of conjuncts.  left_relids and
+ * right_relids are the relids (base rels and joins) found within the
+ * join's two inputs.  A conjunct qualifies when it is a binary btree
+ * ordering comparison (<, <=, >, >=) where one argument references only
+ * right-side relations and the other only left-side relations, and neither
+ * contains volatile functions or subqueries.
+ *
+ * The parser calls this with root = NULL, before planning, to validate the
+ * query; the planner calls it again in deconstruct_distribute to pick out
+ * the clause.  Callers decide what to do when there is not exactly one.
+ * The returned list holds the original conjunct pointers, in order.
+ */
+List *
+find_asof_match_clauses(PlannerInfo *root, List *quals,
+						Relids left_relids, Relids right_relids)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, quals)
+	{
+		Node	   *qual = (Node *) lfirst(lc);
+		OpExpr	   *op;
+		Relids		lvarnos;
+		Relids		rvarnos;
+		bool		lhs_is_left;
+		bool		lhs_is_right;
+
+		if (!IsA(qual, OpExpr))
+			continue;
+		op = (OpExpr *) qual;
+		if (list_length(op->args) != 2)
+			continue;
+		if (contain_volatile_functions(qual) || contain_subplans(qual))
+			continue;
+		if (!is_btree_ordering_op(op->opno))
+			continue;
+
+		lvarnos = pull_varnos(root, linitial(op->args));
+		rvarnos = pull_varnos(root, lsecond(op->args));
+		if (bms_is_empty(lvarnos) || bms_is_empty(rvarnos))
+			continue;
+
+		lhs_is_left = bms_is_subset(lvarnos, left_relids) &&
+			bms_is_subset(rvarnos, right_relids);
+		lhs_is_right = bms_is_subset(lvarnos, right_relids) &&
+			bms_is_subset(rvarnos, left_relids);
+		if (lhs_is_left || lhs_is_right)
+			result = lappend(result, qual);
+	}
+
+	return result;
 }

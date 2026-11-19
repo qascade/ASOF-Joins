@@ -2818,6 +2818,87 @@ create_mergejoin_path(PlannerInfo *root,
 }
 
 /*
+ * create_asofjoin_path
+ *	  Creates a pathnode corresponding to an ASOF join between two relations.
+ *
+ * 'joinrel' is the join relation
+ * 'jointype' is JOIN_ASOF_INNER or JOIN_ASOF_LEFT
+ * 'sjinfo' is the ASOF join's SpecialJoinInfo
+ * 'outer_path' is the path for the ASOF join's left input
+ * 'inner_path' is the path for its right input
+ * 'restrict_clauses' are the RestrictInfo nodes to apply at the join
+ *		(the match clause is not among them)
+ * 'pathkeys' are the path keys of the new join path
+ * 'required_outer' is the set of required outer rels
+ * 'mergeclauses' are the equality RestrictInfos, in sort-key order
+ *		(a subset of restrict_clauses)
+ * 'asof_clause' is the match inequality
+ * 'asof_outer_is_left' is true if the outer input's expression is the
+ *		left operand of asof_clause
+ * 'asof_descending', 'asof_strict' describe the comparison as
+ *		"outer_expr op inner_expr": descending for < and <=, strict for < and >
+ * 'outersortkeys', 'innersortkeys' are the sort orders for the two inputs
+ */
+AsofJoinPath *
+create_asofjoin_path(PlannerInfo *root,
+					 RelOptInfo *joinrel,
+					 JoinType jointype,
+					 SpecialJoinInfo *sjinfo,
+					 Path *outer_path,
+					 Path *inner_path,
+					 List *restrict_clauses,
+					 List *pathkeys,
+					 Relids required_outer,
+					 List *mergeclauses,
+					 RestrictInfo *asof_clause,
+					 bool asof_outer_is_left,
+					 bool asof_descending,
+					 bool asof_strict,
+					 List *outersortkeys,
+					 List *innersortkeys)
+{
+	AsofJoinPath *pathnode = makeNode(AsofJoinPath);
+
+	pathnode->jpath.path.pathtype = T_AsofJoin;
+	pathnode->jpath.path.parent = joinrel;
+	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+	pathnode->jpath.path.param_info =
+		get_joinrel_parampathinfo(root,
+								  joinrel,
+								  outer_path,
+								  inner_path,
+								  sjinfo,
+								  required_outer,
+								  &restrict_clauses);
+	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
+		outer_path->parallel_safe && inner_path->parallel_safe;
+	/* we never build partial ASOF join paths */
+	pathnode->jpath.path.parallel_workers = 0;
+	if (pathnode->jpath.path.param_info)
+		pathnode->jpath.path.rows = pathnode->jpath.path.param_info->ppi_rows;
+	else
+		pathnode->jpath.path.rows = joinrel->rows;
+	pathnode->jpath.path.pathkeys = pathkeys;
+	pathnode->jpath.jointype = jointype;
+	pathnode->jpath.inner_unique = false;
+	pathnode->jpath.outerjoinpath = outer_path;
+	pathnode->jpath.innerjoinpath = inner_path;
+	pathnode->jpath.joinrestrictinfo = restrict_clauses;
+	pathnode->path_mergeclauses = mergeclauses;
+	pathnode->asof_clause = asof_clause;
+	pathnode->asof_outer_is_left = asof_outer_is_left;
+	pathnode->asof_descending = asof_descending;
+	pathnode->asof_strict = asof_strict;
+	pathnode->outersortkeys = outersortkeys;
+	pathnode->innersortkeys = innersortkeys;
+
+	cost_asofjoin(root, pathnode);
+
+	return pathnode;
+}
+
+/*
  * create_hashjoin_path
  *	  Creates a pathnode corresponding to a hash join between two relations.
  *

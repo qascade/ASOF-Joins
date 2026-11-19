@@ -162,6 +162,7 @@ static CustomScan *create_customscan_plan(PlannerInfo *root,
 										  List *tlist, List *scan_clauses);
 static NestLoop *create_nestloop_plan(PlannerInfo *root, NestPath *best_path);
 static MergeJoin *create_mergejoin_plan(PlannerInfo *root, MergePath *best_path);
+static AsofJoin *create_asofjoin_plan(PlannerInfo *root, AsofJoinPath *best_path);
 static HashJoin *create_hashjoin_plan(PlannerInfo *root, HashPath *best_path);
 static Node *replace_nestloop_params(PlannerInfo *root, Node *expr);
 static Node *replace_nestloop_params_mutator(Node *node, PlannerInfo *root);
@@ -419,6 +420,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 		case T_HashJoin:
 		case T_MergeJoin:
 		case T_NestLoop:
+		case T_AsofJoin:
 			plan = create_join_plan(root,
 									(JoinPath *) best_path);
 			break;
@@ -1100,6 +1102,10 @@ create_join_plan(PlannerInfo *root, JoinPath *best_path)
 		case T_NestLoop:
 			plan = (Plan *) create_nestloop_plan(root,
 												 (NestPath *) best_path);
+			break;
+		case T_AsofJoin:
+			plan = (Plan *) create_asofjoin_plan(root,
+												 (AsofJoinPath *) best_path);
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
@@ -4872,6 +4878,132 @@ create_mergejoin_plan(PlannerInfo *root,
 
 	/* Costs of sort and material steps are included in path cost already */
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
+
+	return join_plan;
+}
+
+/*
+ * create_asofjoin_plan
+ *	  Make an AsofJoin plan with a Sort on each input.
+ */
+static AsofJoin *
+create_asofjoin_plan(PlannerInfo *root, AsofJoinPath *best_path)
+{
+	AsofJoin   *join_plan = makeNode(AsofJoin);
+	Plan	   *plan = &join_plan->join.plan;
+	Path	   *outer_path = best_path->jpath.outerjoinpath;
+	Path	   *inner_path = best_path->jpath.innerjoinpath;
+	Relids		outer_relids = outer_path->parent->relids;
+	Plan	   *outer_plan;
+	Plan	   *inner_plan;
+	List	   *joinclauses;
+	List	   *otherclauses;
+	int			nkeys;
+	int			i;
+	ListCell   *lc;
+
+	/* Inputs get sorted, so only fetch the columns we need */
+	outer_plan = create_plan_recurse(root, outer_path, CP_SMALL_TLIST);
+	inner_plan = create_plan_recurse(root, inner_path, CP_SMALL_TLIST);
+
+	/*
+	 * ON-clause quals go in joinqual (checked before picking the nearest
+	 * row); quals pushed down from WHERE go in qual (checked after).
+	 */
+	joinclauses = order_qual_clauses(root, best_path->jpath.joinrestrictinfo);
+	extract_actual_join_clauses(joinclauses,
+								best_path->jpath.path.parent->relids,
+								&joinclauses, &otherclauses);
+
+	/* The merge checks the equality keys itself */
+	joinclauses = list_difference(joinclauses,
+								  get_actual_clauses(best_path->path_mergeclauses));
+
+	if (best_path->jpath.path.param_info)
+	{
+		joinclauses = (List *)
+			replace_nestloop_params(root, (Node *) joinclauses);
+		otherclauses = (List *)
+			replace_nestloop_params(root, (Node *) otherclauses);
+	}
+
+	/* Put the outer side's expression on the left of each clause */
+	join_plan->mergeclauses = get_switched_clauses(best_path->path_mergeclauses,
+												   outer_relids);
+	join_plan->asofclause = (Expr *)
+		linitial(get_switched_clauses(list_make1(best_path->asof_clause),
+									  outer_relids));
+
+	/* Sort both inputs */
+	if (best_path->outersortkeys)
+	{
+		Sort	   *sort = make_sort_from_pathkeys(root, outer_plan,
+												   best_path->outersortkeys,
+												   outer_relids);
+
+		label_sort_with_costsize(root, sort, -1.0);
+		outer_plan = (Plan *) sort;
+	}
+	if (best_path->innersortkeys)
+	{
+		Sort	   *sort = make_sort_from_pathkeys(root, inner_plan,
+												   best_path->innersortkeys,
+												   inner_path->parent->relids);
+
+		label_sort_with_costsize(root, sort, -1.0);
+		inner_plan = (Plan *) sort;
+	}
+
+	/*
+	 * Sort order of each equality key, for the executor.  The inner sort
+	 * keys were built to match the outer ones, so the outer ones are enough.
+	 */
+	nkeys = list_length(best_path->path_mergeclauses);
+	join_plan->mergeFamilies = palloc(nkeys * sizeof(Oid));
+	join_plan->mergeCollations = palloc(nkeys * sizeof(Oid));
+	join_plan->mergeReversals = palloc(nkeys * sizeof(bool));
+	join_plan->mergeNullsFirst = palloc(nkeys * sizeof(bool));
+
+	i = 0;
+	foreach(lc, best_path->path_mergeclauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		EquivalenceClass *ec;
+		PathKey    *pathkey = NULL;
+		ListCell   *lc2;
+
+		/* outer_is_left was set by get_switched_clauses above */
+		ec = rinfo->outer_is_left ? rinfo->left_ec : rinfo->right_ec;
+
+		foreach(lc2, best_path->outersortkeys)
+		{
+			if (((PathKey *) lfirst(lc2))->pk_eclass == ec)
+			{
+				pathkey = (PathKey *) lfirst(lc2);
+				break;
+			}
+		}
+		if (pathkey == NULL)
+			elog(ERROR, "no sort key found for ASOF join key");
+
+		join_plan->mergeFamilies[i] = pathkey->pk_opfamily;
+		join_plan->mergeCollations[i] = ec->ec_collation;
+		join_plan->mergeReversals[i] = (pathkey->pk_cmptype == COMPARE_GT);
+		join_plan->mergeNullsFirst[i] = pathkey->pk_nulls_first;
+		i++;
+	}
+
+	plan->targetlist = build_path_tlist(root, &best_path->jpath.path);
+	plan->qual = otherclauses;
+	plan->lefttree = outer_plan;
+	plan->righttree = inner_plan;
+	join_plan->join.jointype = best_path->jpath.jointype;
+	join_plan->join.inner_unique = false;
+	join_plan->join.joinqual = joinclauses;
+	join_plan->asof_descending = best_path->asof_descending;
+	join_plan->asof_strict = best_path->asof_strict;
+
+	copy_generic_path_info(plan, &best_path->jpath.path);
 
 	return join_plan;
 }

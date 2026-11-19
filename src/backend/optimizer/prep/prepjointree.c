@@ -602,10 +602,12 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 														 NULL, NULL);
 				break;
 			case JOIN_LEFT:
+			case JOIN_ASOF_LEFT:
+			case JOIN_ASOF_INNER:
 				j->quals = pull_up_sublinks_qual_recurse(root, j->quals,
-														 &j->rarg,
-														 rightrelids,
-														 NULL, NULL);
+														&j->rarg,
+														rightrelids,
+														NULL, NULL);
 				break;
 			case JOIN_FULL:
 				/* can't do anything with full-join quals */
@@ -1246,6 +1248,8 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 													 NULL);
 				break;
 			case JOIN_LEFT:
+			case JOIN_ASOF_LEFT:
+			case JOIN_ASOF_INNER:
 			case JOIN_SEMI:
 			case JOIN_ANTI:
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
@@ -3443,6 +3447,13 @@ reduce_outer_joins_pass2(Node *jtnode,
 		/* Can we simplify this join? */
 		switch (jointype)
 		{
+			case JOIN_ASOF_LEFT:
+				/* A strict upper qual on the RHS removes the null-extended rows */
+				if (bms_overlap(nonnullable_rels, right_state->relids))
+					jointype = JOIN_ASOF_INNER;
+				break;
+			case JOIN_ASOF_INNER:
+				break;
 			case JOIN_INNER:
 				break;
 			case JOIN_LEFT:
@@ -3953,6 +3964,10 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 		/* Apply join-type-specific optimization rules */
 		switch (j->jointype)
 		{
+			case JOIN_ASOF_LEFT:
+			case JOIN_ASOF_INNER:
+				/* Don't do anything for now. TODO for the future. */
+				break;
 			case JOIN_INNER:
 
 				/*
@@ -4669,6 +4684,8 @@ get_nullingrels_recurse(Node *jtnode, Relids upper_nullingrels,
 			case JOIN_LEFT:
 			case JOIN_SEMI:
 			case JOIN_ANTI:
+			case JOIN_ASOF_LEFT:
+			case JOIN_ASOF_INNER:
 				local_nullingrels = bms_add_member(bms_copy(upper_nullingrels),
 												   j->rtindex);
 				get_nullingrels_recurse(j->larg, upper_nullingrels, info);
