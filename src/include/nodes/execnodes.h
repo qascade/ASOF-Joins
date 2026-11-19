@@ -2172,13 +2172,38 @@ typedef struct NestLoopState
 /* ----------------
  *	 AsofJoinState information
  *
- *		Nothing extra yet: the ASOF join executor is not written.
+ *		NumKeys			number of equality keys (Merge Cond)
+ *		OuterKeys		per key: expression for the outer (left) side
+ *		InnerKeys		per key: expression for the inner (right) side
+ *		KeySorts		per key: how to compare two key values (<, =, >)
+ *		AsofCond		the match condition, e.g. t.ts >= q.ts
+ *		InnerSlot		the next inner row not yet consumed ("peek" row)
+ *		InnerDone		true once the inner side has no more rows
+ *		BestSlot		our own COPY of the best inner row so far
+ *		HaveBest		true if BestSlot holds a row
+ *		NullInnerSlot	all-NULL inner row, for unmatched outer rows
  * ----------------
  */
 typedef struct AsofJoinState
 {
 	JoinState	js;				/* its first field is NodeTag */
+
+	int			aj_NumKeys;
+	ExprState **aj_OuterKeys;	/* array of length aj_NumKeys */
+	ExprState **aj_InnerKeys;	/* array of length aj_NumKeys */
+	SortSupport aj_KeySorts;	/* array of length aj_NumKeys */
+
+	ExprState  *aj_AsofCond;
+
+	TupleTableSlot *aj_InnerSlot;
+	bool		aj_InnerDone;
+
+	TupleTableSlot *aj_BestSlot;
+	bool		aj_HaveBest;
+
+	TupleTableSlot *aj_NullInnerSlot;
 } AsofJoinState;
+
 
 /* ----------------
  *	 MergeJoinState information
