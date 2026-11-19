@@ -183,22 +183,12 @@ ExecAsofJoin(PlanState *pstate)
 	}
 }
 
-
-
-// static TupleTableSlot *
-// ExecAsofJoin(PlanState *pstate)
-// {
-
-// 	elog(ERROR, "ASOF JOIN executor loop is not written yet");
-// 	return NULL;				/* keep compiler quiet */
-// }
-
-
-
 /*
- * Issue #11 handles only the narrow case: >=, LEFT join, one equality key.
- * Everything else is left to the LATERAL rewrite (enable_asofjoin_native = off).
+ * Issue #11 handles only the narrow case: >=, LEFT join, one equality key,
+ * and no extra ON conditions.  Everything else is left to the LATERAL
+ * rewrite (enable_asofjoin_native = off).
  */
+
 static bool
 asof_is_supported(AsofJoin *node)
 {

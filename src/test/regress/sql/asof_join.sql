@@ -165,9 +165,73 @@ EXPLAIN (COSTS OFF)
 SELECT t.qty, q.price FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts;
 
--- the executor is not written yet
+
+-- native executor (#11): >=, LEFT join, one equality key
+-- (A,5 matches the quote at 5: an exact tie counts for >=)
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+ORDER BY t.sym, t.ts;
+-- WHERE quals above the join filter its output
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price IS NULL
+ORDER BY t.sym, t.ts;
+
+-- NULLs on both sides, duplicate match values, keys present on one side only
+CREATE TABLE asof_trades_n (sym text, ts int);
+CREATE TABLE asof_quotes_n (sym text, ts int);
+INSERT INTO asof_trades_n VALUES
+  ('A', 10), ('A', 20), ('A', 25), ('A', NULL), (NULL, 7),
+  ('B', 15), ('B', 30), ('D', 1);
+INSERT INTO asof_quotes_n VALUES
+  ('A', 8), ('A', 12), ('A', 20), ('A', NULL), (NULL, 1),
+  ('B', 16), ('B', 16), ('E', 0);
+SELECT t.sym, t.ts, q.sym AS qsym, q.ts AS qts
+FROM asof_trades_n t ASOF LEFT JOIN asof_quotes_n q
+  ON t.sym = q.sym AND t.ts >= q.ts
+ORDER BY t.sym, t.ts;
+-- empty right side
+SELECT t.sym, t.ts, q.ts AS qts
+FROM asof_trades_n t ASOF LEFT JOIN (SELECT * FROM asof_quotes_n WHERE false) q
+  ON t.sym = q.sym AND t.ts >= q.ts
+ORDER BY t.sym, t.ts;
+
+-- same rows as the LATERAL rewrite, on the data above and on generated data
+CREATE TABLE asof_trades_g AS
+  SELECT (g % 7)::text AS sym, g AS ts FROM generate_series(1, 2000) g;
+CREATE TABLE asof_quotes_g AS
+  SELECT (g % 9)::text AS sym, g * 3 AS ts FROM generate_series(1, 700) g;
+SET enable_asofjoin_native = off;
+CREATE TEMP TABLE asof_ref_n AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_n t ASOF LEFT JOIN asof_quotes_n q
+    ON t.sym = q.sym AND t.ts >= q.ts;
+CREATE TEMP TABLE asof_ref_g AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_g q
+    ON t.sym = q.sym AND t.ts >= q.ts;
+SET enable_asofjoin_native = on;
+CREATE TEMP TABLE asof_nat_n AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_n t ASOF LEFT JOIN asof_quotes_n q
+    ON t.sym = q.sym AND t.ts >= q.ts;
+CREATE TEMP TABLE asof_nat_g AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_g q
+    ON t.sym = q.sym AND t.ts >= q.ts;
+SELECT 'nulls' AS data,
+       (SELECT count(*) FROM (TABLE asof_ref_n EXCEPT ALL TABLE asof_nat_n) a) AS missing,
+       (SELECT count(*) FROM (TABLE asof_nat_n EXCEPT ALL TABLE asof_ref_n) b) AS extra
+UNION ALL
+SELECT 'generated',
+       (SELECT count(*) FROM (TABLE asof_ref_g EXCEPT ALL TABLE asof_nat_g) a),
+       (SELECT count(*) FROM (TABLE asof_nat_g EXCEPT ALL TABLE asof_ref_g) b);
+DROP TABLE asof_ref_n, asof_ref_g, asof_nat_n, asof_nat_g;
+DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
+
+-- outside #11's scope the executor still refuses to run
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts;
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts > q.ts;
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
 SET enable_asofjoin_native = off;
 
 -- asof is a keyword now, but still usable as a quoted name or column label
