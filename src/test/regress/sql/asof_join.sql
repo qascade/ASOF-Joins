@@ -164,6 +164,21 @@ WHERE q.price IS NULL;
 EXPLAIN (COSTS OFF)
 SELECT t.qty, q.price FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts;
+EXPLAIN (COSTS OFF, FORMAT JSON)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+
+-- views keep the ASOF join and print it back as ASOF syntax
+CREATE VIEW asof_view_left AS
+SELECT t.sym, t.ts, q.price
+FROM asof_trades t LEFT ASOF JOIN asof_quotes q ON t.sym = q.sym AND t.ts >= q.ts;
+CREATE VIEW asof_view_inner AS
+SELECT t.sym, q.price
+FROM asof_trades t ASOF JOIN asof_quotes q ON t.sym = q.sym AND q.ts <= t.ts;
+SELECT pg_get_viewdef('asof_view_left'::regclass, true);
+SELECT pg_get_viewdef('asof_view_inner'::regclass, true);
+SELECT * FROM asof_view_left ORDER BY sym, ts;
+DROP VIEW asof_view_left, asof_view_inner;
 
 
 -- native executor (#11): >=, LEFT join, one equality key
@@ -176,6 +191,26 @@ SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts
 WHERE q.price IS NULL
 ORDER BY t.sym, t.ts;
+-- EXPLAIN ANALYZE counts the rows the WHERE quals removed.  Sort memory
+-- differs between platforms, so it is masked.
+CREATE FUNCTION asof_explain_analyze(query text) RETURNS SETOF text
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln text;
+BEGIN
+    FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query
+    LOOP
+        RETURN NEXT regexp_replace(ln, 'Memory: \d+kB', 'Memory: NkB');
+    END LOOP;
+END;
+$$;
+SELECT asof_explain_analyze($$
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price IS NULL
+$$);
+DROP FUNCTION asof_explain_analyze(text);
 
 -- NULLs on both sides, duplicate match values, keys present on one side only
 CREATE TABLE asof_trades_n (sym text, ts int);

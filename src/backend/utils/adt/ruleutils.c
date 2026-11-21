@@ -12642,6 +12642,18 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 									 PRETTYINDENT_STD,
 									 PRETTYINDENT_JOIN);
 				break;
+			case JOIN_ASOF_INNER:
+				appendContextKeyword(context, " ASOF JOIN ",
+									 -PRETTYINDENT_STD,
+									 PRETTYINDENT_STD,
+									 PRETTYINDENT_JOIN);
+				break;
+			case JOIN_ASOF_LEFT:
+				appendContextKeyword(context, " LEFT ASOF JOIN ",
+									 -PRETTYINDENT_STD,
+									 PRETTYINDENT_STD,
+									 PRETTYINDENT_JOIN);
+				break;
 			default:
 				elog(ERROR, "unrecognized join type: %d",
 					 (int) j->jointype);

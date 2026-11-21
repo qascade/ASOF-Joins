@@ -397,6 +397,104 @@ SELECT t.qty, q.price FROM asof_trades t ASOF JOIN asof_quotes q
          ->  Seq Scan on asof_quotes q
 (9 rows)
 
+EXPLAIN (COSTS OFF, FORMAT JSON)
+SELECT * FROM asof_trades t LEFT ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+                  QUERY PLAN                   
+-----------------------------------------------
+ [                                            +
+   {                                          +
+     "Plan": {                                +
+       "Node Type": "Asof Join",              +
+       "Parallel Aware": false,               +
+       "Async Capable": false,                +
+       "Join Type": "Left",                   +
+       "Disabled": false,                     +
+       "Inner Unique": false,                 +
+       "Merge Cond": "(t.sym = q.sym)",       +
+       "Asof Cond": "(t.ts >= q.ts)",         +
+       "Plans": [                             +
+         {                                    +
+           "Node Type": "Sort",               +
+           "Parent Relationship": "Outer",    +
+           "Parallel Aware": false,           +
+           "Async Capable": false,            +
+           "Disabled": false,                 +
+           "Sort Key": ["t.sym", "t.ts"],     +
+           "Plans": [                         +
+             {                                +
+               "Node Type": "Seq Scan",       +
+               "Parent Relationship": "Outer",+
+               "Parallel Aware": false,       +
+               "Async Capable": false,        +
+               "Relation Name": "asof_trades",+
+               "Alias": "t",                  +
+               "Disabled": false              +
+             }                                +
+           ]                                  +
+         },                                   +
+         {                                    +
+           "Node Type": "Sort",               +
+           "Parent Relationship": "Inner",    +
+           "Parallel Aware": false,           +
+           "Async Capable": false,            +
+           "Disabled": false,                 +
+           "Sort Key": ["q.sym", "q.ts"],     +
+           "Plans": [                         +
+             {                                +
+               "Node Type": "Seq Scan",       +
+               "Parent Relationship": "Outer",+
+               "Parallel Aware": false,       +
+               "Async Capable": false,        +
+               "Relation Name": "asof_quotes",+
+               "Alias": "q",                  +
+               "Disabled": false              +
+             }                                +
+           ]                                  +
+         }                                    +
+       ]                                      +
+     }                                        +
+   }                                          +
+ ]
+(1 row)
+
+-- views keep the ASOF join and print it back as ASOF syntax
+CREATE VIEW asof_view_left AS
+SELECT t.sym, t.ts, q.price
+FROM asof_trades t LEFT ASOF JOIN asof_quotes q ON t.sym = q.sym AND t.ts >= q.ts;
+CREATE VIEW asof_view_inner AS
+SELECT t.sym, q.price
+FROM asof_trades t ASOF JOIN asof_quotes q ON t.sym = q.sym AND q.ts <= t.ts;
+SELECT pg_get_viewdef('asof_view_left'::regclass, true);
+                            pg_get_viewdef                            
+----------------------------------------------------------------------
+  SELECT t.sym,                                                      +
+     t.ts,                                                           +
+     q.price                                                         +
+    FROM asof_trades t                                               +
+      LEFT ASOF JOIN asof_quotes q ON t.sym = q.sym AND t.ts >= q.ts;
+(1 row)
+
+SELECT pg_get_viewdef('asof_view_inner'::regclass, true);
+                         pg_get_viewdef                          
+-----------------------------------------------------------------
+  SELECT t.sym,                                                 +
+     q.price                                                    +
+    FROM asof_trades t                                          +
+      ASOF JOIN asof_quotes q ON t.sym = q.sym AND q.ts <= t.ts;
+(1 row)
+
+SELECT * FROM asof_view_left ORDER BY sym, ts;
+ sym | ts | price 
+-----+----+-------
+ A   |  5 |   105
+ A   | 10 |   108
+ B   |  1 |      
+ B   |  3 |   200
+ C   |  7 |      
+(5 rows)
+
+DROP VIEW asof_view_left, asof_view_inner;
 -- native executor (#11): >=, LEFT join, one equality key
 -- (A,5 matches the quote at 5: an exact tie counts for >=)
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
@@ -422,6 +520,43 @@ ORDER BY t.sym, t.ts;
  C   |  7 |    
 (2 rows)
 
+-- EXPLAIN ANALYZE counts the rows the WHERE quals removed.  Sort memory
+-- differs between platforms, so it is masked.
+CREATE FUNCTION asof_explain_analyze(query text) RETURNS SETOF text
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln text;
+BEGIN
+    FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query
+    LOOP
+        RETURN NEXT regexp_replace(ln, 'Memory: \d+kB', 'Memory: NkB');
+    END LOOP;
+END;
+$$;
+SELECT asof_explain_analyze($$
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price IS NULL
+$$);
+                       asof_explain_analyze                       
+------------------------------------------------------------------
+ Asof Left Join (actual rows=2.00 loops=1)
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   Filter: (q.price IS NULL)
+   Rows Removed by Filter: 3
+   ->  Sort (actual rows=5.00 loops=1)
+         Sort Key: t.sym, t.ts
+         Sort Method: quicksort  Memory: NkB
+         ->  Seq Scan on asof_trades t (actual rows=5.00 loops=1)
+   ->  Sort (actual rows=5.00 loops=1)
+         Sort Key: q.sym, q.ts
+         Sort Method: quicksort  Memory: NkB
+         ->  Seq Scan on asof_quotes q (actual rows=5.00 loops=1)
+(13 rows)
+
+DROP FUNCTION asof_explain_analyze(text);
 -- NULLs on both sides, duplicate match values, keys present on one side only
 CREATE TABLE asof_trades_n (sym text, ts int);
 CREATE TABLE asof_quotes_n (sym text, ts int);

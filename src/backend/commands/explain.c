@@ -2199,7 +2199,13 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							"Asof Cond", planstate, ancestors, es);
 			show_upper_qual(((AsofJoin *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
+			if (((AsofJoin *) plan)->join.joinqual)
+				show_instrumentation_count("Rows Removed by Join Filter", 1,
+										   planstate, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual)
+				show_instrumentation_count("Rows Removed by Filter", 2,
+										   planstate, es);
 			break;
 		case T_HashJoin:
 			show_upper_qual(((HashJoin *) plan)->hashclauses,
