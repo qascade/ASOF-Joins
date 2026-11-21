@@ -179,7 +179,7 @@ ExecAsofJoin(PlanState *pstate)
 		if (ExecQual(node->js.ps.qual, econtext))
 			return ExecProject(node->js.ps.ps_ProjInfo);
 
-		InstrCountFiltered1(node, 1);
+		InstrCountFiltered2(node, 1);
 	}
 }
 
