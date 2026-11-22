@@ -184,9 +184,9 @@ ExecAsofJoin(PlanState *pstate)
 }
 
 /*
- * Issue #11 handles only the narrow case: >=, LEFT join, one equality key,
- * and no extra ON conditions.  Everything else is left to the LATERAL
- * rewrite (enable_asofjoin_native = off).
+ * Only >=, LEFT join and no extra ON conditions for now, with any number of
+ * equality keys.  Everything else is left to the LATERAL rewrite
+ * (enable_asofjoin_native = off).
  */
 
 static bool
@@ -195,7 +195,6 @@ asof_is_supported(AsofJoin *node)
 	return node->join.jointype == JOIN_ASOF_LEFT &&
 		!node->asof_descending &&
 		!node->asof_strict &&
-		list_length(node->mergeclauses) == 1 &&
 		node->join.joinqual == NIL;
 }
 
