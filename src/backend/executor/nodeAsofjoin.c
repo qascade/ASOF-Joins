@@ -294,6 +294,13 @@ ExecInitAsofJoin(AsofJoin *node, EState *estate, int eflags)
 	innerPlanState(asofstate) = ExecInitNode(innerPlan(node), estate, eflags);
 	innerDesc = ExecGetResultType(innerPlanState(asofstate));
 
+	/*
+	 * Inner values are read from the child's slot, from our copy in
+	 * aj_BestSlot or from the all-NULL slot, so the slot type is not fixed.
+	 */
+	asofstate->js.ps.inneropsset = true;
+	asofstate->js.ps.inneropsfixed = false;
+
 	/* output row slot, and projection of the SELECT list */
 	ExecInitResultTupleSlotTL(&asofstate->js.ps, &TTSOpsVirtual);
 	ExecAssignProjectionInfo(&asofstate->js.ps, NULL);

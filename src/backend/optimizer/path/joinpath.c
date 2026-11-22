@@ -2643,7 +2643,7 @@ select_mergejoin_clauses(PlannerInfo *root,
  * Returns the list of such opfamilies (empty if there is none); *opfamily
  * and *cmptype describe the first one, which is the one we sort by.
  */
-static List *
+List *
 asof_match_opfamilies(Oid opno, Oid lefttype, Oid righttype,
 					  Oid *opfamily, CompareType *cmptype)
 {
@@ -2728,6 +2728,8 @@ add_asofjoin_path(PlannerInfo *root,
 	RestrictInfo *asof_clause = sjinfo->asof_clause;
 	Path	   *outer_path = outerrel->cheapest_total_path;
 	Path	   *inner_path = innerrel->cheapest_total_path;
+	Path	   *outer_paths[2];
+	Path	   *inner_paths[2];
 	Relids		required_outer;
 	List	   *mergeclause_list;
 	bool		mergejoin_allowed;
@@ -2764,7 +2766,6 @@ add_asofjoin_path(PlannerInfo *root,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the right side of ASOF JOIN cannot refer to its left side"),
 				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
-	required_outer = calc_non_nestloop_required_outer(outer_path, inner_path);
 
 	/*
 	 * Equality keys.  This is what sort_inner_and_outer does for a merge
@@ -2862,21 +2863,55 @@ add_asofjoin_path(PlannerInfo *root,
 	/* The output comes out in the outer input's order */
 	merge_pathkeys = build_join_pathkeys(root, joinrel, jointype, outerkeys);
 
-	add_path(joinrel, (Path *)
-			 create_asofjoin_path(root,
-								  joinrel,
-								  jointype,
-								  sjinfo,
-								  outer_path,
-								  inner_path,
-								  restrictlist,
-								  merge_pathkeys,
-								  required_outer,
-								  mergeclauses,
-								  asof_clause,
-								  outer_is_left,
-								  descending,
-								  strict,
-								  outerkeys,
-								  innerkeys));
+	/*
+	 * For each input, try the cheapest path and also the cheapest one that is
+	 * already in the order we need, such as an index scan.  An input already
+	 * in order needs no Sort.  add_path keeps whichever combination is
+	 * cheapest.
+	 */
+	outer_paths[0] = outer_path;
+	outer_paths[1] = get_cheapest_path_for_pathkeys(outerrel->pathlist,
+													outerkeys, NULL,
+													TOTAL_COST, false);
+	inner_paths[0] = inner_path;
+	inner_paths[1] = get_cheapest_path_for_pathkeys(innerrel->pathlist,
+													innerkeys, NULL,
+													TOTAL_COST, false);
+
+	for (int i = 0; i < 2; i++)
+	{
+		for (int j = 0; j < 2; j++)
+		{
+			Path	   *opath = outer_paths[i];
+			Path	   *ipath = inner_paths[j];
+
+			/* no sorted path exists, or it is the cheapest path again */
+			if (opath == NULL || ipath == NULL ||
+				(i == 1 && opath == outer_path) ||
+				(j == 1 && ipath == inner_path))
+				continue;
+
+			required_outer = calc_non_nestloop_required_outer(opath, ipath);
+
+			add_path(joinrel, (Path *)
+					 create_asofjoin_path(root,
+										  joinrel,
+										  jointype,
+										  sjinfo,
+										  opath,
+										  ipath,
+										  restrictlist,
+										  merge_pathkeys,
+										  required_outer,
+										  mergeclauses,
+										  asof_clause,
+										  outer_is_left,
+										  descending,
+										  strict,
+										  pathkeys_contained_in(outerkeys, opath->pathkeys) ?
+										  NIL : outerkeys,
+										  pathkeys_contained_in(innerkeys, ipath->pathkeys) ?
+										  NIL : innerkeys));
+		}
+	}
 }

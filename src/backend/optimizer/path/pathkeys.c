@@ -37,6 +37,7 @@ static bool matches_boolean_partition_clause(RestrictInfo *rinfo,
 											 int partkeycol);
 static Var *find_var_for_subquery_tle(RelOptInfo *rel, TargetEntry *tle);
 static bool right_merge_direction(PlannerInfo *root, PathKey *pathkey);
+static bool is_asof_match_eclass(PlannerInfo *root, EquivalenceClass *ec);
 
 
 /****************************************************************************
@@ -2043,6 +2044,39 @@ trim_mergeclauses_for_inner_pathkeys(PlannerInfo *root,
  ****************************************************************************/
 
 /*
+ * is_asof_match_eclass
+ *		Is ec one side of an ASOF join's match clause?
+ *
+ * initsplan.c gives both sides of the match clause an EquivalenceClass.
+ * The ASOF join sorts its inputs on it, so that order is worth keeping.
+ */
+static bool
+is_asof_match_eclass(PlannerInfo *root, EquivalenceClass *ec)
+{
+	foreach_node(SpecialJoinInfo, sjinfo, root->join_info_list)
+	{
+		RestrictInfo *rinfo = sjinfo->asof_clause;
+		EquivalenceClass *left_ec;
+		EquivalenceClass *right_ec;
+
+		if (rinfo == NULL || rinfo->left_ec == NULL)
+			continue;
+
+		/* the classes may have been merged into others since */
+		left_ec = rinfo->left_ec;
+		while (left_ec->ec_merged)
+			left_ec = left_ec->ec_merged;
+		right_ec = rinfo->right_ec;
+		while (right_ec->ec_merged)
+			right_ec = right_ec->ec_merged;
+
+		if (ec == left_ec || ec == right_ec)
+			return true;
+	}
+	return false;
+}
+
+/*
  * pathkeys_useful_for_merging
  *		Count the number of pathkeys that may be useful for mergejoins
  *		above the given relation.
@@ -2071,6 +2105,13 @@ pathkeys_useful_for_merging(PlannerInfo *root, RelOptInfo *rel, List *pathkeys)
 		PathKey    *pathkey = (PathKey *) lfirst(i);
 		bool		matched = false;
 		ListCell   *j;
+
+		/* An ASOF join also sorts on its match column, in either direction */
+		if (is_asof_match_eclass(root, pathkey->pk_eclass))
+		{
+			useful++;
+			continue;
+		}
 
 		/* If "wrong" direction, not useful for merging */
 		if (!right_merge_direction(root, pathkey))
