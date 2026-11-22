@@ -4896,6 +4896,7 @@ create_asofjoin_plan(PlannerInfo *root, AsofJoinPath *best_path)
 	Relids		outer_relids = outer_path->parent->relids;
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
+	List	   *outerpathkeys;
 	List	   *joinclauses;
 	List	   *otherclauses;
 	int			nkeys;
@@ -4957,7 +4958,10 @@ create_asofjoin_plan(PlannerInfo *root, AsofJoinPath *best_path)
 	/*
 	 * Sort order of each equality key, for the executor.  The inner sort
 	 * keys were built to match the outer ones, so the outer ones are enough.
+	 * With no outer Sort, the outer path is already in this order.
 	 */
+	outerpathkeys = best_path->outersortkeys ? best_path->outersortkeys :
+		outer_path->pathkeys;
 	nkeys = list_length(best_path->path_mergeclauses);
 	join_plan->mergeFamilies = palloc(nkeys * sizeof(Oid));
 	join_plan->mergeCollations = palloc(nkeys * sizeof(Oid));
@@ -4975,7 +4979,7 @@ create_asofjoin_plan(PlannerInfo *root, AsofJoinPath *best_path)
 		/* outer_is_left was set by get_switched_clauses above */
 		ec = rinfo->outer_is_left ? rinfo->left_ec : rinfo->right_ec;
 
-		foreach(lc2, best_path->outersortkeys)
+		foreach(lc2, outerpathkeys)
 		{
 			if (((PathKey *) lfirst(lc2))->pk_eclass == ec)
 			{

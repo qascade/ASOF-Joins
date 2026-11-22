@@ -97,6 +97,8 @@ extern void add_paths_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 								 RelOptInfo *outerrel, RelOptInfo *innerrel,
 								 JoinType jointype, SpecialJoinInfo *sjinfo,
 								 List *restrictlist);
+extern List *asof_match_opfamilies(Oid opno, Oid lefttype, Oid righttype,
+								   Oid *opfamily, CompareType *cmptype);
 
 /*
  * joinrels.c

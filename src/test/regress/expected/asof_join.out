@@ -631,7 +631,66 @@ SELECT 'generated',
  generated |       0 |     0
 (2 rows)
 
-DROP TABLE asof_ref_n, asof_ref_g, asof_nat_n, asof_nat_g;
+-- inputs already in (key, match column) order from an index need no Sort
+CREATE INDEX ON asof_trades_g (sym, ts);
+CREATE INDEX ON asof_quotes_g (sym, ts);
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_g q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Asof Left Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   ->  Index Only Scan using asof_trades_g_sym_ts_idx on asof_trades_g t
+   ->  Index Only Scan using asof_quotes_g_sym_ts_idx on asof_quotes_g q
+(5 rows)
+
+CREATE TEMP TABLE asof_idx_g AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_g q
+    ON t.sym = q.sym AND t.ts >= q.ts;
+SELECT (SELECT count(*) FROM (TABLE asof_ref_g EXCEPT ALL TABLE asof_idx_g) a) AS missing,
+       (SELECT count(*) FROM (TABLE asof_idx_g EXCEPT ALL TABLE asof_ref_g) b) AS extra;
+ missing | extra 
+---------+-------
+       0 |     0
+(1 row)
+
+-- only the right input has a matching index: the left one is still sorted
+DROP INDEX asof_trades_g_sym_ts_idx;
+EXPLAIN (COSTS OFF)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_g q
+  ON t.sym = q.sym AND t.ts >= q.ts;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Asof Left Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   ->  Sort
+         Sort Key: t.sym, t.ts
+         ->  Seq Scan on asof_trades_g t
+               Disabled: true
+   ->  Index Only Scan using asof_quotes_g_sym_ts_idx on asof_quotes_g q
+(8 rows)
+
+-- < wants the match column descending, which a (sym, ts DESC NULLS LAST) index gives
+CREATE INDEX ON asof_trades_g (sym, ts DESC NULLS LAST);
+CREATE INDEX ON asof_quotes_g (sym, ts DESC NULLS LAST);
+EXPLAIN (COSTS OFF)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_g q
+  ON t.sym = q.sym AND t.ts < q.ts;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Asof Left Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts < q.ts)
+   ->  Index Only Scan using asof_trades_g_sym_ts_idx on asof_trades_g t
+   ->  Index Only Scan using asof_quotes_g_sym_ts_idx1 on asof_quotes_g q
+(5 rows)
+
+RESET enable_seqscan;
+DROP TABLE asof_ref_n, asof_ref_g, asof_nat_n, asof_nat_g, asof_idx_g;
 DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
 -- outside #11's scope the executor still refuses to run
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q

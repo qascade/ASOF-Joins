@@ -1631,6 +1631,37 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
 													NULL,	/* incompatible_relids */
 													jtitem->nonnullable_rels);
 
+			/*
+			 * Give each side of the match clause an EquivalenceClass, as
+			 * initialize_mergeclause_eclasses does for merge clauses.  Without
+			 * one, an index on the match column never reports its sort order
+			 * (see build_index_pathkeys), so the join could not skip a Sort.
+			 */
+			{
+				OpExpr	   *op = castNode(OpExpr, match);
+				Oid			lefttype;
+				Oid			righttype;
+				Oid			opfamily;
+				CompareType cmptype;
+				List	   *opfamilies;
+
+				op_input_types(op->opno, &lefttype, &righttype);
+				opfamilies = asof_match_opfamilies(op->opno, lefttype, righttype,
+												   &opfamily, &cmptype);
+				/* no usable sort order: add_asofjoin_path reports it */
+				if (opfamilies != NIL)
+				{
+					sjinfo->asof_clause->left_ec =
+						get_eclass_for_sort_expr(root, linitial(op->args),
+												 opfamilies, lefttype,
+												 op->inputcollid, 0, NULL, true);
+					sjinfo->asof_clause->right_ec =
+						get_eclass_for_sort_expr(root, lsecond(op->args),
+												 opfamilies, righttype,
+												 op->inputcollid, 0, NULL, true);
+				}
+			}
+
 			/* The join needs the match columns, so make the inputs emit them */
 			add_vars_to_targetlist(root,
 								   pull_var_clause((Node *) match,
