@@ -45,6 +45,7 @@
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -1145,28 +1146,107 @@ asofJoinTreeRelids(Node *jtnode)
  * expression of the right input and an expression of the left input.  The
  * planner finds it again with the same rules (find_asof_match_clauses) and
  * treats it specially; every other conjunct is an ordinary join condition.
+ *
+ * When there is none, we report why the conjunct that came closest does
+ * not qualify (classify_asof_match_clause), pointing at that conjunct.
  */
 static void
 checkAsofMatchClause(ParseState *pstate, JoinExpr *j)
 {
-	List	   *matches;
+	List	   *quals = make_ands_implicit((Expr *) j->quals);
+	Relids		left_relids = asofJoinTreeRelids(j->larg);
+	Relids		right_relids = asofJoinTreeRelids(j->rarg);
+	List	   *matches = NIL;
+	AsofMatchStatus worst = ASOF_MATCH_EQUALITY;
+	Node	   *worst_qual = NULL;
+	ListCell   *lc;
 
-	matches = find_asof_match_clauses(NULL,
-									  make_ands_implicit((Expr *) j->quals),
-									  asofJoinTreeRelids(j->larg),
-									  asofJoinTreeRelids(j->rarg));
+	foreach(lc, quals)
+	{
+		Node	   *qual = (Node *) lfirst(lc);
+		AsofMatchStatus status;
 
-	if (matches == NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("ASOF JOIN condition must contain an inequality between the joined relations"),
-				 errhint("Add a condition such as \"left.ts >= right.ts\" to the ON clause."),
-				 parser_errposition(pstate, exprLocation(j->quals))));
+		status = classify_asof_match_clause(NULL, qual,
+											left_relids, right_relids);
+		if (status == ASOF_MATCH_OK)
+			matches = lappend(matches, qual);
+		else if (status > worst)
+		{
+			worst = status;
+			worst_qual = qual;
+		}
+	}
+
 	if (list_length(matches) > 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("ASOF JOIN condition must contain exactly one inequality between the joined relations"),
 				 parser_errposition(pstate, exprLocation(lsecond(matches)))));
+	if (matches != NIL)
+		return;
+
+	switch (worst)
+	{
+		case ASOF_MATCH_ONE_SIDED:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("ASOF JOIN match condition must compare the left input with the right input"),
+					 errdetail("This comparison does not reference both inputs."),
+					 errhint("Add a condition such as \"left.ts >= right.ts\" to the ON clause."),
+					 parser_errposition(pstate, exprLocation(worst_qual))));
+			break;
+		case ASOF_MATCH_NOT_ORDERING:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("operator %s cannot be used as the ASOF JOIN match condition",
+							format_operator(((OpExpr *) worst_qual)->opno)),
+					 errdetail("The match condition must be a <, <=, > or >= comparison of a btree operator class."),
+					 parser_errposition(pstate, exprLocation(worst_qual))));
+			break;
+		case ASOF_MATCH_NO_SORT_ORDER:
+			{
+				Oid			lefttype;
+				Oid			righttype;
+
+				op_input_types(((OpExpr *) worst_qual)->opno,
+							   &lefttype, &righttype);
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("ASOF JOIN match condition cannot sort types %s and %s",
+								format_type_be(lefttype),
+								format_type_be(righttype)),
+						 errdetail("Both inputs are sorted on the match condition, so each type needs a \"<\" operator in the operator's btree operator family."),
+						 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join."),
+						 parser_errposition(pstate, exprLocation(worst_qual))));
+			}
+			break;
+		case ASOF_MATCH_VOLATILE:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ASOF JOIN match condition cannot contain volatile functions"),
+					 parser_errposition(pstate, exprLocation(worst_qual))));
+			break;
+		case ASOF_MATCH_SUBQUERY:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ASOF JOIN match condition cannot contain a subquery"),
+					 parser_errposition(pstate, exprLocation(worst_qual))));
+			break;
+		case ASOF_MATCH_MIXED_OPERAND:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("each side of the ASOF JOIN match condition must reference only one input"),
+					 errhint("Rearrange the comparison so that one side uses only columns of the left input and the other only columns of the right input."),
+					 parser_errposition(pstate, exprLocation(worst_qual))));
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("ASOF JOIN condition must contain an inequality between the joined relations"),
+					 errhint("Add a condition such as \"left.ts >= right.ts\" to the ON clause."),
+					 parser_errposition(pstate, exprLocation(j->quals))));
+			break;
+	}
 }
 
 /*

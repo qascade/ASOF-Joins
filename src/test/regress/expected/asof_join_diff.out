@@ -331,40 +331,40 @@ FROM (VALUES
 ) AS c(id, name, query),
 LATERAL asof_diff(query) d
 ORDER BY id;
-                          name                           |                                                 status                                                 | native | nrows | missing | extra 
----------------------------------------------------------+--------------------------------------------------------------------------------------------------------+--------+-------+---------+-------
- expression on the left operand                          | ok                                                                                                     | t      |  2000 |       0 |     0
- expression on the right operand                         | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side | t      |       |         |      
- expression in the equality key                          | ok                                                                                                     | t      |  2000 |       0 |     0
- WHERE on the left side                                  | ok                                                                                                     | t      |  1000 |       0 |     0
- WHERE on the right side, not strict                     | ok                                                                                                     | t      |  1005 |       0 |     0
- WHERE on the right side, strict (LEFT reduced to INNER) | ok                                                                                                     | t      |   993 |       0 |     0
- WHERE on the right side, INNER                          | ok                                                                                                     | t      |   993 |       0 |     0
- WHERE on both sides                                     | ok                                                                                                     | t      |   221 |       0 |     0
- ON qual on the right side only                          | ok                                                                                                     | t      |  2000 |       0 |     0
- ON qual on the left side only                           | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
- ON sublink on the right side only                       | ok                                                                                                     | t      |  2000 |       0 |     0
- ON clause folds to false, LEFT                          | native error: could not identify the match condition of ASOF JOIN                                      | f      |       |         |      
- ON clause folds to false, INNER                         | native error: could not identify the match condition of ASOF JOIN                                      | f      |       |         |      
- ON clause with a nested AND                             | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side | f      |       |         |      
- no equality key                                         | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
- two equality keys                                       | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
- extra ON qual on both sides                             | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
- right side is a flattened subquery                      | ok                                                                                                     | t      |  2000 |       0 |     0
- right side is a view                                    | ok                                                                                                     | t      |  2000 |       0 |     0
- right side is a subquery with a constant match column   | native error: could not identify the match condition of ASOF JOIN                                      | f      |       |         |      
- right side is an aggregate subquery                     | ok                                                                                                     | t      |  2000 |       0 |     0
- left side is a subquery                                 | ok                                                                                                     | t      |  1385 |       0 |     0
- ordinary join on the left input                         | ok                                                                                                     | t      |  2000 |       0 |     0
- ordinary join above, on a right-side column             | ok                                                                                                     | t      |  1988 |       0 |     0
- LEFT join above, on a right-side column                 | ok                                                                                                     | t      |  2000 |       0 |     0
- two ASOF joins in a row                                 | ok                                                                                                     | t      |  2000 |       0 |     0
- ASOF join on the output of another ASOF join            | ok                                                                                                     | t      |  1988 |       0 |     0
- aggregate over the join                                 | ok                                                                                                     | t      |     7 |       0 |     0
- ORDER BY ... LIMIT in the join's own order              | ok                                                                                                     | t      |    25 |       0 |     0
- ORDER BY ... LIMIT against the join's order             | ok                                                                                                     | t      |    25 |       0 |     0
- in a CTE, used twice                                    | ok                                                                                                     | t      |  1993 |       0 |     0
- in an EXISTS sublink                                    | ok                                                                                                     | t      |     7 |       0 |     0
+                          name                           |                                                     status                                                      | native | nrows | missing | extra 
+---------------------------------------------------------+-----------------------------------------------------------------------------------------------------------------+--------+-------+---------+-------
+ expression on the left operand                          | ok                                                                                                              | t      |  2000 |       0 |     0
+ expression on the right operand                         | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side          | t      |       |         |      
+ expression in the equality key                          | ok                                                                                                              | t      |  2000 |       0 |     0
+ WHERE on the left side                                  | ok                                                                                                              | t      |  1000 |       0 |     0
+ WHERE on the right side, not strict                     | ok                                                                                                              | t      |  1005 |       0 |     0
+ WHERE on the right side, strict (LEFT reduced to INNER) | ok                                                                                                              | t      |   993 |       0 |     0
+ WHERE on the right side, INNER                          | ok                                                                                                              | t      |   993 |       0 |     0
+ WHERE on both sides                                     | ok                                                                                                              | t      |   221 |       0 |     0
+ ON qual on the right side only                          | ok                                                                                                              | t      |  2000 |       0 |     0
+ ON qual on the left side only                           | native error: native ASOF JOIN does not support join conditions other than the equality and the match condition | t      |       |         |      
+ ON sublink on the right side only                       | ok                                                                                                              | t      |  2000 |       0 |     0
+ ON clause folds to false, LEFT                          | native error: could not identify the match condition of ASOF JOIN                                               | f      |       |         |      
+ ON clause folds to false, INNER                         | native error: could not identify the match condition of ASOF JOIN                                               | f      |       |         |      
+ ON clause with a nested AND                             | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side          | f      |       |         |      
+ no equality key                                         | native error: native ASOF JOIN requires an equality condition between the joined relations                      | t      |       |         |      
+ two equality keys                                       | native error: native ASOF JOIN supports only one equality condition                                             | t      |       |         |      
+ extra ON qual on both sides                             | native error: native ASOF JOIN does not support join conditions other than the equality and the match condition | t      |       |         |      
+ right side is a flattened subquery                      | ok                                                                                                              | t      |  2000 |       0 |     0
+ right side is a view                                    | ok                                                                                                              | t      |  2000 |       0 |     0
+ right side is a subquery with a constant match column   | native error: could not identify the match condition of ASOF JOIN                                               | f      |       |         |      
+ right side is an aggregate subquery                     | ok                                                                                                              | t      |  2000 |       0 |     0
+ left side is a subquery                                 | ok                                                                                                              | t      |  1385 |       0 |     0
+ ordinary join on the left input                         | ok                                                                                                              | t      |  2000 |       0 |     0
+ ordinary join above, on a right-side column             | ok                                                                                                              | t      |  1988 |       0 |     0
+ LEFT join above, on a right-side column                 | ok                                                                                                              | t      |  2000 |       0 |     0
+ two ASOF joins in a row                                 | ok                                                                                                              | t      |  2000 |       0 |     0
+ ASOF join on the output of another ASOF join            | ok                                                                                                              | t      |  1988 |       0 |     0
+ aggregate over the join                                 | ok                                                                                                              | t      |     7 |       0 |     0
+ ORDER BY ... LIMIT in the join's own order              | ok                                                                                                              | t      |    25 |       0 |     0
+ ORDER BY ... LIMIT against the join's order             | ok                                                                                                              | t      |    25 |       0 |     0
+ in a CTE, used twice                                    | ok                                                                                                              | t      |  1993 |       0 |     0
+ in an EXISTS sublink                                    | ok                                                                                                              | t      |     7 |       0 |     0
 (32 rows)
 
 --

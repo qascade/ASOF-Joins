@@ -198,16 +198,33 @@ ExecAsofJoin(PlanState *pstate)
  * The executor handles all four comparison operators and both LEFT and INNER
  * joins, but still only one equality key and no extra ON conditions.
  * Everything else is left to the LATERAL rewrite (enable_asofjoin_native =
- * off).
+ * off).  Raise an error saying which limit this join runs into.
  */
-
-static bool
-asof_is_supported(AsofJoin *node)
+static void
+asof_check_supported(AsofJoin *node)
 {
-	return (node->join.jointype == JOIN_ASOF_LEFT ||
-			node->join.jointype == JOIN_ASOF_INNER) &&
-		list_length(node->mergeclauses) == 1 &&
-		node->join.joinqual == NIL;
+	int			nkeys = list_length(node->mergeclauses);
+
+	Assert(node->join.jointype == JOIN_ASOF_LEFT ||
+		   node->join.jointype == JOIN_ASOF_INNER);
+
+	if (nkeys == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("native ASOF JOIN requires an equality condition between the joined relations"),
+				 errhint("Add a condition such as \"left.key = right.key\", or set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+	if (nkeys > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("native ASOF JOIN supports only one equality condition"),
+				 errdetail("The ON clause has %d equality conditions between the joined relations.", nkeys),
+				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+	if (node->join.joinqual != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("native ASOF JOIN does not support join conditions other than the equality and the match condition"),
+				 errdetail("Conditions that use only the right input are allowed."),
+				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
 }
 
 /*
@@ -285,11 +302,8 @@ ExecInitAsofJoin(AsofJoin *node, EState *estate, int eflags)
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
 
 	/* Outside the narrow case: plain EXPLAIN is fine, running is not */
-	if (!asof_is_supported(node) && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("ASOF JOIN executor is not implemented yet"),
-				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+	if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		asof_check_supported(node);
 
 	asofstate = makeNode(AsofJoinState);
 	asofstate->js.ps.plan = (Plan *) node;
