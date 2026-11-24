@@ -139,6 +139,16 @@ SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= q.ts + random()::int;
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
+-- the error says why the closest conjunct is not a match condition
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts + t.qty;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= t.qty;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.sym ~~ q.sym;
+-- the most specific reason wins, wherever it is in the ON clause
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON q.ts >= 3 AND t.ts <> q.ts AND t.ts >= q.ts + t.qty;
 
 -- native plans: both inputs sorted on the equality keys, then the match column
 EXPLAIN (COSTS OFF)
@@ -319,9 +329,18 @@ ORDER BY t.sym, t.ts;
 
 -- (comparisons against the LATERAL rewrite are in asof_join_diff.sql)
 
--- extra ON conditions are not handled by the native executor yet
+-- shapes the native executor does not handle yet; plain EXPLAIN still works
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty > 1;
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.ts >= q.ts;
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.qty = q.price AND t.ts >= q.ts;
+-- the planner cannot find the match condition once the ON clause folds to false
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND 1 = 0;
 SET enable_asofjoin_native = off;
 
 -- asof is a keyword now, but still usable as a quoted name or column label
