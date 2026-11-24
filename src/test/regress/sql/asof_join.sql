@@ -285,11 +285,78 @@ RESET enable_seqscan;
 DROP TABLE asof_ref_n, asof_ref_g, asof_nat_n, asof_nat_g, asof_idx_g;
 DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
 
--- outside #11's scope the executor still refuses to run
-SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
-  ON t.sym = q.sym AND t.ts >= q.ts;
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.sym = q.sym AND t.ts > q.ts;
+-- native executor (#12): all four operators, LEFT and INNER joins
+-- (A,5 and A,10 / B,3 show whether an exact tie counts)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts > q.ts
+ORDER BY t.sym, t.ts;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts <= q.ts
+ORDER BY t.sym, t.ts;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts
+ORDER BY t.sym, t.ts;
+-- match clause written right side first
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON q.sym = t.sym AND q.ts > t.ts
+ORDER BY t.sym, t.ts;
+-- INNER drops trades without a match
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+ORDER BY t.sym, t.ts;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF INNER JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts
+ORDER BY t.sym, t.ts;
+-- a strict WHERE qual on the right side reduces LEFT to INNER
+EXPLAIN (COSTS OFF)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price > 100;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price > 100
+ORDER BY t.sym, t.ts;
+
+-- same rows as the LATERAL rewrite, for every operator and join type, on
+-- data with NULLs and duplicates and on generated data
+CREATE TABLE asof_trades_n (sym text, ts int);
+CREATE TABLE asof_quotes_n (sym text, ts int);
+INSERT INTO asof_trades_n VALUES
+  ('A', 10), ('A', 20), ('A', 25), ('A', NULL), (NULL, 7),
+  ('B', 15), ('B', 16), ('B', 30), ('D', 1);
+INSERT INTO asof_quotes_n VALUES
+  ('A', 8), ('A', 12), ('A', 20), ('A', NULL), (NULL, 1),
+  ('B', 16), ('B', 16), ('E', 0);
+CREATE TABLE asof_trades_g AS
+  SELECT (g % 7)::text AS sym, g AS ts FROM generate_series(1, 2000) g;
+CREATE TABLE asof_quotes_g AS
+  SELECT (g % 9)::text AS sym, g * 3 AS ts FROM generate_series(1, 700) g;
+CREATE FUNCTION asof_diff(q text) RETURNS TABLE (missing bigint, extra bigint)
+LANGUAGE plpgsql AS
+$$
+BEGIN
+    SET LOCAL enable_asofjoin_native = off;
+    EXECUTE 'CREATE TEMP TABLE asof_ref AS ' || q;
+    SET LOCAL enable_asofjoin_native = on;
+    EXECUTE 'CREATE TEMP TABLE asof_nat AS ' || q;
+    RETURN QUERY
+      SELECT (SELECT count(*) FROM (TABLE asof_ref EXCEPT ALL TABLE asof_nat) a),
+             (SELECT count(*) FROM (TABLE asof_nat EXCEPT ALL TABLE asof_ref) b);
+    DROP TABLE asof_ref, asof_nat;
+END;
+$$;
+SELECT tbl, jt, op, d.*
+FROM (VALUES ('n'), ('g')) AS tb(tbl),
+     (VALUES ('LEFT'), ('INNER')) AS j(jt),
+     (VALUES ('>='), ('>'), ('<='), ('<')) AS o(op),
+     LATERAL asof_diff(format(
+       'SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_%s t ASOF %s JOIN asof_quotes_%s q '
+       'ON t.sym = q.sym AND t.ts %s q.ts', tbl, jt, tbl, op)) d
+ORDER BY 1 DESC, 2 DESC, 3;
+DROP FUNCTION asof_diff(text);
+DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
+
+-- extra ON conditions are still left to the rewrite
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
 SET enable_asofjoin_native = off;
