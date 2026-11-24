@@ -794,65 +794,8 @@ ORDER BY t.sym, t.ts;
  B   |  3 |   2
 (3 rows)
 
--- same rows as the LATERAL rewrite, for every operator and join type, on
--- data with NULLs and duplicates and on generated data
-CREATE TABLE asof_trades_n (sym text, ts int);
-CREATE TABLE asof_quotes_n (sym text, ts int);
-INSERT INTO asof_trades_n VALUES
-  ('A', 10), ('A', 20), ('A', 25), ('A', NULL), (NULL, 7),
-  ('B', 15), ('B', 16), ('B', 30), ('D', 1);
-INSERT INTO asof_quotes_n VALUES
-  ('A', 8), ('A', 12), ('A', 20), ('A', NULL), (NULL, 1),
-  ('B', 16), ('B', 16), ('E', 0);
-CREATE TABLE asof_trades_g AS
-  SELECT (g % 7)::text AS sym, g AS ts FROM generate_series(1, 2000) g;
-CREATE TABLE asof_quotes_g AS
-  SELECT (g % 9)::text AS sym, g * 3 AS ts FROM generate_series(1, 700) g;
-CREATE FUNCTION asof_diff(q text) RETURNS TABLE (missing bigint, extra bigint)
-LANGUAGE plpgsql AS
-$$
-BEGIN
-    SET LOCAL enable_asofjoin_native = off;
-    EXECUTE 'CREATE TEMP TABLE asof_ref AS ' || q;
-    SET LOCAL enable_asofjoin_native = on;
-    EXECUTE 'CREATE TEMP TABLE asof_nat AS ' || q;
-    RETURN QUERY
-      SELECT (SELECT count(*) FROM (TABLE asof_ref EXCEPT ALL TABLE asof_nat) a),
-             (SELECT count(*) FROM (TABLE asof_nat EXCEPT ALL TABLE asof_ref) b);
-    DROP TABLE asof_ref, asof_nat;
-END;
-$$;
-SELECT tbl, jt, op, d.*
-FROM (VALUES ('n'), ('g')) AS tb(tbl),
-     (VALUES ('LEFT'), ('INNER')) AS j(jt),
-     (VALUES ('>='), ('>'), ('<='), ('<')) AS o(op),
-     LATERAL asof_diff(format(
-       'SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_%s t ASOF %s JOIN asof_quotes_%s q '
-       'ON t.sym = q.sym AND t.ts %s q.ts', tbl, jt, tbl, op)) d
-ORDER BY 1 DESC, 2 DESC, 3;
- tbl |  jt   | op | missing | extra 
------+-------+----+---------+-------
- n   | LEFT  | <  |       0 |     0
- n   | LEFT  | <= |       0 |     0
- n   | LEFT  | >  |       0 |     0
- n   | LEFT  | >= |       0 |     0
- n   | INNER | <  |       0 |     0
- n   | INNER | <= |       0 |     0
- n   | INNER | >  |       0 |     0
- n   | INNER | >= |       0 |     0
- g   | LEFT  | <  |       0 |     0
- g   | LEFT  | <= |       0 |     0
- g   | LEFT  | >  |       0 |     0
- g   | LEFT  | >= |       0 |     0
- g   | INNER | <  |       0 |     0
- g   | INNER | <= |       0 |     0
- g   | INNER | >  |       0 |     0
- g   | INNER | >= |       0 |     0
-(16 rows)
-
-DROP FUNCTION asof_diff(text);
-DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
--- extra ON conditions are still left to the rewrite
+-- (comparisons against the LATERAL rewrite are in asof_join_diff.sql)
+-- extra ON conditions are not handled by the native executor yet
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
 ERROR:  ASOF JOIN executor is not implemented yet

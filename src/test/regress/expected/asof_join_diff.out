@@ -1,0 +1,482 @@
+--
+-- ASOF JOIN: native path against the LATERAL rewrite
+--
+-- With enable_asofjoin_native off, an ASOF join is rewritten into a
+-- LATERAL subquery with ORDER BY ... LIMIT 1.  That rewrite is simple
+-- enough to trust, so it serves as the oracle: every query below is run
+-- both ways and the two results must hold the same rows.
+--
+-- asof_diff(query) reports one row:
+--   status   'ok', or the error either side raised.  A shape the native
+--            executor does not handle yet shows up as "native error: ASOF
+--            JOIN executor is not implemented yet" and flips to 'ok' once
+--            it does, so this file doubles as the list of what is missing.
+--   native   whether the plan with the switch on contains an Asof node
+--            (false means the native path was bypassed, not tested)
+--   nrows    rows the oracle returned, so an empty result is visible
+--   missing  oracle rows the native result lacks
+--   extra    native rows the oracle lacks
+--
+-- Ties: when several right rows share the key and the match value, any one
+-- of them is a correct answer, and the two paths may pick different ones.
+-- The queries therefore only select right-side columns that are equal
+-- across tied rows (the key and the match column).
+--
+CREATE FUNCTION asof_diff(query text,
+                          OUT status text, OUT native bool, OUT nrows bigint,
+                          OUT missing bigint, OUT extra bigint)
+LANGUAGE plpgsql SET client_min_messages = warning AS
+$$
+DECLARE
+    saved text := current_setting('enable_asofjoin_native');
+    ln text;
+BEGIN
+    status := 'ok';
+    native := false;
+    DROP TABLE IF EXISTS asof_ref, asof_nat;
+
+    PERFORM set_config('enable_asofjoin_native', 'off', true);
+    BEGIN
+        EXECUTE 'CREATE TEMP TABLE asof_ref AS ' || query;
+    EXCEPTION WHEN OTHERS THEN
+        status := 'oracle error: ' || SQLERRM;
+    END;
+
+    PERFORM set_config('enable_asofjoin_native', 'on', true);
+    BEGIN
+        FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+            native := native OR ln ~ 'Asof';
+        END LOOP;
+        EXECUTE 'CREATE TEMP TABLE asof_nat AS ' || query;
+    EXCEPTION WHEN OTHERS THEN
+        IF status = 'ok' THEN
+            status := 'native error: ' || SQLERRM;
+        END IF;
+    END;
+
+    PERFORM set_config('enable_asofjoin_native', saved, true);
+
+    IF status = 'ok' THEN
+        EXECUTE 'SELECT count(*) FROM asof_ref' INTO nrows;
+        EXECUTE 'SELECT count(*) FROM (TABLE asof_ref EXCEPT ALL TABLE asof_nat) a'
+            INTO missing;
+        EXECUTE 'SELECT count(*) FROM (TABLE asof_nat EXCEPT ALL TABLE asof_ref) b'
+            INTO extra;
+    END IF;
+    DROP TABLE IF EXISTS asof_ref, asof_nat;
+END;
+$$;
+-- small data: NULL keys and match values, duplicate match values (ties),
+-- keys present on one side only
+CREATE TABLE asof_t_n (sym text, ts int, qty int);
+CREATE TABLE asof_q_n (sym text, ts int);
+INSERT INTO asof_t_n VALUES
+  ('A', 10, 1), ('A', 20, 2), ('A', 25, 3), ('A', NULL, 4), (NULL, 7, 5),
+  ('B', 15, 6), ('B', 16, 7), ('B', 30, 8), ('D', 1, 9);
+INSERT INTO asof_q_n VALUES
+  ('A', 8), ('A', 12), ('A', 20), ('A', NULL), (NULL, 1),
+  ('B', 16), ('B', 16), ('E', 0);
+-- generated data: many keys, partly overlapping match values
+CREATE TABLE asof_t_g AS
+  SELECT (g % 7)::text AS sym, g AS ts, g % 13 AS qty
+  FROM generate_series(1, 2000) g;
+CREATE TABLE asof_q_g AS
+  SELECT (g % 9)::text AS sym, g * 3 AS ts
+  FROM generate_series(1, 700) g;
+ANALYZE asof_t_n, asof_q_n, asof_t_g, asof_q_g;
+--
+-- Every operator and join type, with the match clause written both ways
+-- round, on both data sets
+--
+SELECT tbl, jt, op, written, d.*
+FROM (VALUES ('n'), ('g')) AS tb(tbl),
+     (VALUES ('LEFT'), ('INNER')) AS j(jt),
+     (VALUES ('>=', '<='), ('>', '<'), ('<=', '>='), ('<', '>')) AS o(op, commuted),
+     (VALUES ('t op q'), ('q op t')) AS w(written),
+     LATERAL asof_diff(format(
+       'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_%s t ASOF %s JOIN asof_q_%s q '
+       'ON t.sym = q.sym AND %s',
+       tbl, jt, tbl,
+       CASE written WHEN 't op q' THEN 't.ts ' || op || ' q.ts'
+                    ELSE 'q.ts ' || commuted || ' t.ts' END)) d
+ORDER BY 1 DESC, 2 DESC, 3, 4 DESC;
+ tbl |  jt   | op | written | status | native | nrows | missing | extra 
+-----+-------+----+---------+--------+--------+-------+---------+-------
+ n   | LEFT  | <  | t op q  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | <  | q op t  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | <= | t op q  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | <= | q op t  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | >  | t op q  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | >  | q op t  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | >= | t op q  | ok     | t      |     9 |       0 |     0
+ n   | LEFT  | >= | q op t  | ok     | t      |     9 |       0 |     0
+ n   | INNER | <  | t op q  | ok     | t      |     2 |       0 |     0
+ n   | INNER | <  | q op t  | ok     | t      |     2 |       0 |     0
+ n   | INNER | <= | t op q  | ok     | t      |     4 |       0 |     0
+ n   | INNER | <= | q op t  | ok     | t      |     4 |       0 |     0
+ n   | INNER | >  | t op q  | ok     | t      |     4 |       0 |     0
+ n   | INNER | >  | q op t  | ok     | t      |     4 |       0 |     0
+ n   | INNER | >= | t op q  | ok     | t      |     5 |       0 |     0
+ n   | INNER | >= | q op t  | ok     | t      |     5 |       0 |     0
+ g   | LEFT  | <  | t op q  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | <  | q op t  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | <= | t op q  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | <= | q op t  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | >  | t op q  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | >  | q op t  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | >= | t op q  | ok     | t      |  2000 |       0 |     0
+ g   | LEFT  | >= | q op t  | ok     | t      |  2000 |       0 |     0
+ g   | INNER | <  | t op q  | ok     | t      |  2000 |       0 |     0
+ g   | INNER | <  | q op t  | ok     | t      |  2000 |       0 |     0
+ g   | INNER | <= | t op q  | ok     | t      |  2000 |       0 |     0
+ g   | INNER | <= | q op t  | ok     | t      |  2000 |       0 |     0
+ g   | INNER | >  | t op q  | ok     | t      |  1988 |       0 |     0
+ g   | INNER | >  | q op t  | ok     | t      |  1988 |       0 |     0
+ g   | INNER | >= | t op q  | ok     | t      |  1988 |       0 |     0
+ g   | INNER | >= | q op t  | ok     | t      |  1988 |       0 |     0
+(32 rows)
+
+--
+-- Other data types in the match column
+--
+CREATE TABLE asof_t_ty AS
+  SELECT (g % 3)::text AS sym,
+         g::int4 AS i4,
+         date '2026-01-01' + g AS d,
+         CASE WHEN g % 50 = 0 THEN 'NaN'::float8
+              WHEN g % 77 = 0 THEN '-Infinity'::float8
+              ELSE g / 4.0 END AS f,
+         lpad(g::text, 4, '0') AS s
+  FROM generate_series(1, 300) g;
+CREATE TABLE asof_q_ty AS
+  SELECT (g % 4)::text AS sym,
+         (g * 2)::int8 AS i8,
+         timestamp '2026-01-01' + g * interval '29 hours' AS tsp,
+         CASE WHEN g % 40 = 0 THEN 'NaN'::float8
+              WHEN g % 61 = 0 THEN 'Infinity'::float8
+              ELSE g / 3.0 END AS f,
+         lpad((g * 2)::text, 4, '0') AS s
+  FROM generate_series(1, 200) g;
+ANALYZE asof_t_ty, asof_q_ty;
+SELECT name, d.*
+FROM (VALUES
+  (1, 'int4 >= int8',
+   'SELECT t.sym, t.i4, q.i8 FROM asof_t_ty t ASOF LEFT JOIN asof_q_ty q
+      ON t.sym = q.sym AND t.i4 >= q.i8'),
+  (2, 'int8 < int4, INNER',
+   'SELECT t.sym, t.i4, q.i8 FROM asof_t_ty t ASOF JOIN asof_q_ty q
+      ON t.sym = q.sym AND q.i8 > t.i4'),
+  (3, 'date >= timestamp',
+   'SELECT t.sym, t.d, q.tsp FROM asof_t_ty t ASOF LEFT JOIN asof_q_ty q
+      ON t.sym = q.sym AND t.d >= q.tsp'),
+  (4, 'float8 with NaN and infinities, >=',
+   'SELECT t.sym, t.f, q.f AS qf FROM asof_t_ty t ASOF LEFT JOIN asof_q_ty q
+      ON t.sym = q.sym AND t.f >= q.f'),
+  (5, 'float8 with NaN and infinities, <',
+   'SELECT t.sym, t.f, q.f AS qf FROM asof_t_ty t ASOF LEFT JOIN asof_q_ty q
+      ON t.sym = q.sym AND t.f < q.f'),
+  (6, 'text, C collation',
+   'SELECT t.sym, t.s, q.s AS qs FROM asof_t_ty t ASOF LEFT JOIN asof_q_ty q
+      ON t.sym = q.sym AND t.s COLLATE "C" >= q.s'),
+  (7, 'text, C collation, descending',
+   'SELECT t.sym, t.s, q.s AS qs FROM asof_t_ty t ASOF LEFT JOIN asof_q_ty q
+      ON t.sym = q.sym AND t.s COLLATE "C" <= q.s')
+) AS c(id, name, query),
+LATERAL asof_diff(query) d
+ORDER BY id;
+                name                | status | native | nrows | missing | extra 
+------------------------------------+--------+--------+-------+---------+-------
+ int4 >= int8                       | ok     | t      |   300 |       0 |     0
+ int8 < int4, INNER                 | ok     | t      |   300 |       0 |     0
+ date >= timestamp                  | ok     | t      |   300 |       0 |     0
+ float8 with NaN and infinities, >= | ok     | t      |   300 |       0 |     0
+ float8 with NaN and infinities, <  | ok     | t      |   300 |       0 |     0
+ text, C collation                  | ok     | t      |   300 |       0 |     0
+ text, C collation, descending      | ok     | t      |   300 |       0 |     0
+(7 rows)
+
+--
+-- Query shapes around the join
+--
+CREATE TABLE asof_syms (sym text, region text);
+INSERT INTO asof_syms SELECT g::text, 'r' || (g % 3) FROM generate_series(0, 8) g;
+CREATE VIEW asof_q_even AS SELECT sym, ts FROM asof_q_g WHERE ts % 2 = 0;
+ANALYZE asof_syms;
+SELECT name, d.*
+FROM (VALUES
+  -- expressions in the match clause
+  (1, 'expression on the left operand',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts - 5 >= q.ts'),
+  -- the rewrite needs a bare right-side column, so this one has no oracle
+  (2, 'expression on the right operand',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts * 2'),
+  (3, 'expression in the equality key',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym || '''' = q.sym AND t.ts >= q.ts'),
+  -- WHERE quals must filter the join result, not the candidates
+  (10, 'WHERE on the left side',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE t.ts > 1000'),
+  (11, 'WHERE on the right side, not strict',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE q.ts IS NULL OR q.ts % 2 = 0'),
+  (12, 'WHERE on the right side, strict (LEFT reduced to INNER)',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE q.ts % 2 = 0'),
+  (13, 'WHERE on the right side, INNER',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE q.ts % 2 = 0'),
+  (14, 'WHERE on both sides',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE t.ts - q.ts < 3'),
+  -- ON quals on one side only
+  (20, 'ON qual on the right side only',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts AND q.ts % 2 = 0'),
+  (21, 'ON qual on the left side only',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts AND t.ts > 1000'),
+  (22, 'ON sublink on the right side only',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts
+      AND q.sym IN (SELECT sym FROM asof_syms WHERE region = ''r1'')'),
+  (23, 'ON clause folds to false, LEFT',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts AND 1 = 0'),
+  (24, 'ON clause folds to false, INNER',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts AND 1 = 0'),
+  -- only top-level ANDs are searched for the match clause, on both paths
+  (25, 'ON clause with a nested AND',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND (t.ts >= q.ts AND q.ts > 0)'),
+  -- not handled by the native executor yet
+  (30, 'no equality key',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_n t ASOF LEFT JOIN asof_q_n q
+      ON t.ts >= q.ts'),
+  (31, 'two equality keys',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.qty = q.ts % 13 AND t.ts >= q.ts'),
+  (32, 'extra ON qual on both sides',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts AND t.qty <> q.ts % 13'),
+  -- what is on either side of the join
+  (40, 'right side is a flattened subquery',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN
+      (SELECT sym, ts FROM asof_q_g WHERE ts % 2 = 0) q
+      ON t.sym = q.sym AND t.ts >= q.ts'),
+  (41, 'right side is a view',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_even q
+      ON t.sym = q.sym AND t.ts >= q.ts'),
+  (42, 'right side is a subquery with a constant match column',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_n t ASOF LEFT JOIN
+      (SELECT sym, 15 AS ts FROM asof_q_n) q
+      ON t.sym = q.sym AND t.ts >= q.ts'),
+  (43, 'right side is an aggregate subquery',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN
+      (SELECT sym, max(ts) AS ts FROM asof_q_g GROUP BY sym, ts / 100) q
+      ON t.sym = q.sym AND t.ts >= q.ts'),
+  (44, 'left side is a subquery',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM
+      (SELECT sym, ts * 2 AS ts FROM asof_t_g WHERE qty > 3) t
+      ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts'),
+  -- other joins around the ASOF join
+  (50, 'ordinary join on the left input',
+   'SELECT t.sym, t.ts, s.region, q.ts AS qts
+      FROM (asof_t_g t JOIN asof_syms s ON t.sym = s.sym)
+      ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts'),
+  (51, 'ordinary join above, on a right-side column',
+   'SELECT t.sym, t.ts, q.ts AS qts, s.region
+      FROM asof_t_g t ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts
+      JOIN asof_syms s ON q.sym = s.sym'),
+  (52, 'LEFT join above, on a right-side column',
+   'SELECT t.sym, t.ts, q.ts AS qts, s.region
+      FROM asof_t_g t ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts
+      LEFT JOIN asof_syms s ON q.sym = s.sym AND s.region = ''r2'''),
+  (53, 'two ASOF joins in a row',
+   'SELECT t.sym, t.ts, q1.ts AS q1ts, q2.ts AS q2ts
+      FROM asof_t_g t
+      ASOF LEFT JOIN asof_q_g q1 ON t.sym = q1.sym AND t.ts >= q1.ts
+      ASOF LEFT JOIN asof_q_g q2 ON t.sym = q2.sym AND t.ts < q2.ts'),
+  (54, 'ASOF join on the output of another ASOF join',
+   'SELECT t.sym, t.ts, q1.ts AS q1ts, q2.ts AS q2ts
+      FROM asof_t_g t
+      ASOF JOIN asof_q_g q1 ON t.sym = q1.sym AND t.ts >= q1.ts
+      ASOF LEFT JOIN asof_q_g q2 ON q1.sym = q2.sym AND q1.ts > q2.ts'),
+  -- what is done with the result
+  (60, 'aggregate over the join',
+   'SELECT t.sym, count(q.ts), sum(t.ts - q.ts)
+      FROM asof_t_g t ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts
+      GROUP BY t.sym'),
+  (61, 'ORDER BY ... LIMIT in the join''s own order',
+   'SELECT t.sym, t.ts, q.ts AS qts
+      FROM asof_t_g t ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts
+      ORDER BY t.sym, t.ts LIMIT 25'),
+  (62, 'ORDER BY ... LIMIT against the join''s order',
+   'SELECT t.sym, t.ts, q.ts AS qts
+      FROM asof_t_g t ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts < q.ts
+      ORDER BY t.sym, t.ts LIMIT 25'),
+  (63, 'in a CTE, used twice',
+   'WITH a AS MATERIALIZED (
+      SELECT t.sym, t.ts, q.ts AS qts
+      FROM asof_t_g t ASOF LEFT JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts)
+    SELECT a1.sym, a1.ts, a1.qts, a2.qts AS qts2
+    FROM a a1 JOIN a a2 ON a1.sym = a2.sym AND a1.ts = a2.ts + 7'),
+  (64, 'in an EXISTS sublink',
+   'SELECT s.sym FROM asof_syms s WHERE EXISTS (
+      SELECT 1 FROM asof_t_g t ASOF JOIN asof_q_g q ON t.sym = q.sym AND t.ts >= q.ts
+      WHERE t.sym = s.sym AND t.ts - q.ts = 2)')
+) AS c(id, name, query),
+LATERAL asof_diff(query) d
+ORDER BY id;
+                          name                           |                                                 status                                                 | native | nrows | missing | extra 
+---------------------------------------------------------+--------------------------------------------------------------------------------------------------------+--------+-------+---------+-------
+ expression on the left operand                          | ok                                                                                                     | t      |  2000 |       0 |     0
+ expression on the right operand                         | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side | t      |       |         |      
+ expression in the equality key                          | ok                                                                                                     | t      |  2000 |       0 |     0
+ WHERE on the left side                                  | ok                                                                                                     | t      |  1000 |       0 |     0
+ WHERE on the right side, not strict                     | ok                                                                                                     | t      |  1005 |       0 |     0
+ WHERE on the right side, strict (LEFT reduced to INNER) | ok                                                                                                     | t      |   993 |       0 |     0
+ WHERE on the right side, INNER                          | ok                                                                                                     | t      |   993 |       0 |     0
+ WHERE on both sides                                     | ok                                                                                                     | t      |   221 |       0 |     0
+ ON qual on the right side only                          | ok                                                                                                     | t      |  2000 |       0 |     0
+ ON qual on the left side only                           | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
+ ON sublink on the right side only                       | ok                                                                                                     | t      |  2000 |       0 |     0
+ ON clause folds to false, LEFT                          | native error: could not identify the match condition of ASOF JOIN                                      | f      |       |         |      
+ ON clause folds to false, INNER                         | native error: could not identify the match condition of ASOF JOIN                                      | f      |       |         |      
+ ON clause with a nested AND                             | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side | f      |       |         |      
+ no equality key                                         | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
+ two equality keys                                       | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
+ extra ON qual on both sides                             | native error: ASOF JOIN executor is not implemented yet                                                | t      |       |         |      
+ right side is a flattened subquery                      | ok                                                                                                     | t      |  2000 |       0 |     0
+ right side is a view                                    | ok                                                                                                     | t      |  2000 |       0 |     0
+ right side is a subquery with a constant match column   | native error: could not identify the match condition of ASOF JOIN                                      | f      |       |         |      
+ right side is an aggregate subquery                     | ok                                                                                                     | t      |  2000 |       0 |     0
+ left side is a subquery                                 | ok                                                                                                     | t      |  1385 |       0 |     0
+ ordinary join on the left input                         | ok                                                                                                     | t      |  2000 |       0 |     0
+ ordinary join above, on a right-side column             | ok                                                                                                     | t      |  1988 |       0 |     0
+ LEFT join above, on a right-side column                 | ok                                                                                                     | t      |  2000 |       0 |     0
+ two ASOF joins in a row                                 | ok                                                                                                     | t      |  2000 |       0 |     0
+ ASOF join on the output of another ASOF join            | ok                                                                                                     | t      |  1988 |       0 |     0
+ aggregate over the join                                 | ok                                                                                                     | t      |     7 |       0 |     0
+ ORDER BY ... LIMIT in the join's own order              | ok                                                                                                     | t      |    25 |       0 |     0
+ ORDER BY ... LIMIT against the join's order             | ok                                                                                                     | t      |    25 |       0 |     0
+ in a CTE, used twice                                    | ok                                                                                                     | t      |  1993 |       0 |     0
+ in an EXISTS sublink                                    | ok                                                                                                     | t      |     7 |       0 |     0
+(32 rows)
+
+--
+-- Inputs that arrive sorted from an index, so the plan has no Sort
+--
+CREATE INDEX ON asof_t_g (sym, ts);
+CREATE INDEX ON asof_q_g (sym, ts);
+CREATE INDEX ON asof_t_g (sym, ts DESC NULLS LAST);
+CREATE INDEX ON asof_q_g (sym, ts DESC NULLS LAST);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT jt, op, d.*
+FROM (VALUES ('LEFT'), ('INNER')) AS j(jt),
+     (VALUES ('>='), ('>'), ('<='), ('<')) AS o(op),
+     LATERAL asof_diff(format(
+       'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF %s JOIN asof_q_g q '
+       'ON t.sym = q.sym AND t.ts %s q.ts', jt, op)) d
+ORDER BY 1 DESC, 2;
+  jt   | op | status | native | nrows | missing | extra 
+-------+----+--------+--------+-------+---------+-------
+ LEFT  | <  | ok     | t      |  2000 |       0 |     0
+ LEFT  | <= | ok     | t      |  2000 |       0 |     0
+ LEFT  | >  | ok     | t      |  2000 |       0 |     0
+ LEFT  | >= | ok     | t      |  2000 |       0 |     0
+ INNER | <  | ok     | t      |  2000 |       0 |     0
+ INNER | <= | ok     | t      |  2000 |       0 |     0
+ INNER | >  | ok     | t      |  1988 |       0 |     0
+ INNER | >= | ok     | t      |  1988 |       0 |     0
+(8 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+--
+-- Sorts that spill to disk
+--
+CREATE TABLE asof_t_big AS
+  SELECT (g % 11)::text AS sym, (g * 7) % 100003 AS ts
+  FROM generate_series(1, 30000) g;
+CREATE TABLE asof_q_big AS
+  SELECT (g % 13)::text AS sym, (g * 5) % 100019 AS ts
+  FROM generate_series(1, 30000) g;
+-- The oracle probes this index once per left row; without it the test
+-- takes minutes.  The native plan still sorts the left input, and both
+-- inputs for <, which wants the match column descending.
+CREATE INDEX ON asof_q_big (sym, ts);
+ANALYZE asof_t_big, asof_q_big;
+SET work_mem = '64kB';
+SELECT jt, op, d.*
+FROM (VALUES ('LEFT'), ('INNER')) AS j(jt),
+     (VALUES ('>='), ('<')) AS o(op),
+     LATERAL asof_diff(format(
+       'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_big t ASOF %s JOIN asof_q_big q '
+       'ON t.sym = q.sym AND t.ts %s q.ts', jt, op)) d
+ORDER BY 1 DESC, 2;
+  jt   | op | status | native | nrows | missing | extra 
+-------+----+--------+--------+-------+---------+-------
+ LEFT  | <  | ok     | t      | 30000 |       0 |     0
+ LEFT  | >= | ok     | t      | 30000 |       0 |     0
+ INNER | <  | ok     | t      | 29995 |       0 |     0
+ INNER | >= | ok     | t      | 29995 |       0 |     0
+(4 rows)
+
+RESET work_mem;
+--
+-- Prepared statements, with generic and custom plans.  The switch is read
+-- when the statement is analyzed, so each side is prepared under its own
+-- setting.
+--
+SET enable_asofjoin_native = off;
+PREPARE asof_p_ref(int) AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+    ON t.sym = q.sym AND t.ts - $1 >= q.ts;
+SET enable_asofjoin_native = on;
+PREPARE asof_p_nat(int) AS
+  SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+    ON t.sym = q.sym AND t.ts - $1 >= q.ts;
+CREATE FUNCTION asof_diff_prepared(arg int, OUT missing bigint, OUT extra bigint)
+LANGUAGE plpgsql AS
+$$
+BEGIN
+    EXECUTE format('CREATE TEMP TABLE asof_ref AS EXECUTE asof_p_ref(%s)', arg);
+    EXECUTE format('CREATE TEMP TABLE asof_nat AS EXECUTE asof_p_nat(%s)', arg);
+    SELECT count(*) INTO missing FROM (TABLE asof_ref EXCEPT ALL TABLE asof_nat) a;
+    SELECT count(*) INTO extra FROM (TABLE asof_nat EXCEPT ALL TABLE asof_ref) b;
+    DROP TABLE asof_ref, asof_nat;
+END;
+$$;
+SET plan_cache_mode = force_custom_plan;
+SELECT 'custom' AS plan, arg, d.* FROM generate_series(0, 4, 2) arg,
+  LATERAL asof_diff_prepared(arg) d;
+  plan  | arg | missing | extra 
+--------+-----+---------+-------
+ custom |   0 |       0 |     0
+ custom |   2 |       0 |     0
+ custom |   4 |       0 |     0
+(3 rows)
+
+SET plan_cache_mode = force_generic_plan;
+SELECT 'generic' AS plan, arg, d.* FROM generate_series(0, 4, 2) arg,
+  LATERAL asof_diff_prepared(arg) d;
+  plan   | arg | missing | extra 
+---------+-----+---------+-------
+ generic |   0 |       0 |     0
+ generic |   2 |       0 |     0
+ generic |   4 |       0 |     0
+(3 rows)
+
+RESET plan_cache_mode;
+DEALLOCATE asof_p_ref;
+DEALLOCATE asof_p_nat;
+DROP FUNCTION asof_diff_prepared(int);
+DROP VIEW asof_q_even;
+DROP TABLE asof_t_n, asof_q_n, asof_t_g, asof_q_g, asof_t_ty, asof_q_ty,
+  asof_syms, asof_t_big, asof_q_big;
+DROP FUNCTION asof_diff(text);
