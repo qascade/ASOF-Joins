@@ -84,17 +84,42 @@ The `ON` clause holds the usual equality keys plus **exactly one** inequality
 left. That inequality decides which direction "nearest" means. `ASOF LEFT JOIN` keeps left
 rows with no match and fills the right columns with NULL; `ASOF JOIN` drops them.
 
-Today it is implemented by rewriting the query into an equivalent
-`LEFT JOIN LATERAL (... ORDER BY ts DESC LIMIT 1)` during parse analysis, so it performs
-exactly like the hand-written form. Phase 2 adds a native sort-merge join and a setting to
-choose between the two. See `docs/lateral-rewrite.pdf` for how the rewrite works, and
-`docs/asof-join.pdf` for the operator itself.
+There are two ways to run it, chosen by the `enable_asofjoin_native` setting:
 
-### Performance today
+- **Native (default, `on`).** A sort-merge join: both inputs are sorted on the equality
+  keys and then the match column, and one forward pass finds each left row's match.
+  `EXPLAIN` shows it as `Asof Left Join` or `Asof Join`, with `Merge Cond` (the keys) and
+  `Asof Cond` (the inequality).
+- **Rewrite (`off`).** The query is rewritten during parse analysis into an equivalent
+  `LEFT JOIN LATERAL (... ORDER BY ts DESC LIMIT 1)`, so it runs exactly like the
+  hand-written form.
 
-Phase 1 is a rewrite, not a new algorithm, so it performs **exactly** like the hand-written
-LATERAL query — the planner receives the same tree and produces the same plan. Both forms
-of the bulk query produce byte-identical plans:
+The native join supports:
+
+- LEFT and INNER ASOF joins, with all four operators: `>=`, `>`, `<=` and `<`
+- any number of equality keys, including none
+- inputs that are already in order: with a btree index on `(key, ts)` (for `>=` and `>`)
+  or `(key, ts DESC NULLS LAST)` (for `<=` and `<`) there is no Sort in the plan
+- extra conditions in `ON` that use only the right table, and any `WHERE` conditions
+
+Not supported yet by the native join (set `enable_asofjoin_native = off` for these):
+
+- other `ON` conditions that use both tables, such as `t.qty < q.size`
+- use inside a correlated subquery, which needs the node to restart (#14)
+
+The native join always sorts and merges. When only a few left rows are joined, or the
+query has a small `LIMIT`, and the right table has a matching index, the rewrite's one
+index lookup per left row can be faster. The planner does not choose between the two.
+
+See `docs/project-report-final.pdf` for the full report, `docs/asof-join.pdf` for the
+operator, and `docs/lateral-rewrite.pdf` for the rewrite.
+
+### Phase 1 performance (the rewrite)
+
+These measurements are from Phase 1, before the native join existed. The rewrite is not a
+new algorithm, so it performs **exactly** like the hand-written LATERAL query. The planner
+receives the same tree and produces the same plan. Both forms of the bulk query produce
+byte-identical plans:
 
 ```
 Nested Loop Left Join
@@ -158,9 +183,10 @@ comparison holds, but the absolute numbers are not representative. Reproduce wit
 `psql -X -f test.sql`, which prints `debug_assertions` and `work_mem` before the timings for
 exactly this reason.
 
-Phase 2 replaces the per-row index search with a single sorted pass over both inputs, which
-is where an actual speedup comes from — most of all when no suitable index exists, since
-the plan above then degrades to a sort per left row.
+The native join replaces the per-row index search with a single sorted pass over both
+inputs. The gain is largest when no suitable index exists, since the rewrite then scans
+the right table once per left row. Step 9 of the [demo](#demo-about-10-minutes) shows this,
+and `docs/bench-baseline.md` has the rewrite's baseline timings.
 
 ### Testing it
 
@@ -173,7 +199,11 @@ createdb asoftest
 psql -d asoftest -X -f test.sql
 ```
 
-It covers all four inequality directions, left and inner, other key and time types, empty
+The regression suite has two ASOF files. `src/test/regress/sql/asof_join.sql` covers syntax,
+errors, plans and results. `asof_join_diff.sql` runs every query both ways, native and
+rewrite, and checks that they return the same rows.
+
+`test.sql` covers all four inequality directions, left and inner, other key and time types, empty
 inputs, and a 50k x 200k bulk case that also reports timings. Data is seeded, so rows and
 diffs are identical on every run. Timings are only comparable against runs with the same
 build and settings, which is why the script prints `debug_assertions` and `work_mem` first
@@ -515,7 +545,7 @@ template asks you to paste the summary line. On failure, read
 ## macOS notes
 
 Verified on macOS 14.5 (Apple clang, SDK 14.4) with Homebrew bison 3.8.2 and m4 1.4.21:
-`configure` clean, full build clean, **231 of 231 regression tests passed**.
+`configure` clean, full build clean, **233 of 233 regression tests passed**.
 
 Differences from the Linux instructions:
 
