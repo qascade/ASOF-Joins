@@ -191,7 +191,7 @@ SELECT * FROM asof_view_left ORDER BY sym, ts;
 DROP VIEW asof_view_left, asof_view_inner;
 
 
--- native executor (#11): >=, LEFT join, one equality key
+-- native executor: >=, LEFT join
 -- (A,5 matches the quote at 5: an exact tie counts for >=)
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts
@@ -221,6 +221,23 @@ SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
 WHERE q.price IS NULL
 $$);
 DROP FUNCTION asof_explain_analyze(text);
+
+-- several equality keys, with NULLs in each key and groups on one side only
+CREATE TABLE asof_trades_k (sym text, venue text, ts int);
+CREATE TABLE asof_quotes_k (sym text, venue text, ts int);
+INSERT INTO asof_trades_k VALUES
+  ('A', 'X', 10), ('A', 'X', 20), ('A', 'Y', 15), ('A', NULL, 12),
+  (NULL, 'X', 9), ('B', 'X', 5), ('B', 'Z', 30), ('C', 'X', 40);
+INSERT INTO asof_quotes_k VALUES
+  ('A', 'X', 8), ('A', 'X', 18), ('A', 'X', 18), ('A', 'Y', 16),
+  ('A', NULL, 11), (NULL, 'X', 1), ('B', 'X', 6), ('B', 'Z', 25);
+EXPLAIN (COSTS OFF)
+SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
+  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts;
+SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
+  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
+ORDER BY t.sym, t.venue, t.ts;
+DROP TABLE asof_trades_k, asof_quotes_k;
 
 -- NULLs on both sides, duplicate match values, keys present on one side only
 CREATE TABLE asof_trades_n (sym text, ts int);
@@ -334,10 +351,6 @@ SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty > 1;
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.ts >= q.ts;
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.sym = q.sym AND t.qty = q.price AND t.ts >= q.ts;
 -- the planner cannot find the match condition once the ON clause folds to false
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND 1 = 0;

@@ -213,14 +213,21 @@ FROM (VALUES
   (25, 'ON clause with a nested AND',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
       ON t.sym = q.sym AND (t.ts >= q.ts AND q.ts > 0)'),
-  -- not handled by the native executor yet
+  -- number of equality keys
   (30, 'no equality key',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_n t ASOF LEFT JOIN asof_q_n q
       ON t.ts >= q.ts'),
   (31, 'two equality keys',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
       ON t.sym = q.sym AND t.qty = q.ts % 13 AND t.ts >= q.ts'),
-  (32, 'extra ON qual on both sides',
+  (32, 'one left column against two right expressions',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.sym = (q.ts % 7)::text AND t.ts >= q.ts'),
+  (33, 'only key turned into a filter by a constant',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE t.sym = ''1'''),
+  -- not handled by the native executor yet
+  (34, 'extra ON qual on both sides',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
       ON t.sym = q.sym AND t.ts >= q.ts AND t.qty <> q.ts % 13'),
   -- what is on either side of the join

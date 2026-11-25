@@ -252,14 +252,21 @@ FROM (VALUES
   (25, 'ON clause with a nested AND',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
       ON t.sym = q.sym AND (t.ts >= q.ts AND q.ts > 0)'),
-  -- not handled by the native executor yet
+  -- number of equality keys
   (30, 'no equality key',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_n t ASOF LEFT JOIN asof_q_n q
       ON t.ts >= q.ts'),
   (31, 'two equality keys',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
       ON t.sym = q.sym AND t.qty = q.ts % 13 AND t.ts >= q.ts'),
-  (32, 'extra ON qual on both sides',
+  (32, 'one left column against two right expressions',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.sym = (q.ts % 7)::text AND t.ts >= q.ts'),
+  (33, 'only key turned into a filter by a constant',
+   'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
+      ON t.sym = q.sym AND t.ts >= q.ts WHERE t.sym = ''1'''),
+  -- not handled by the native executor yet
+  (34, 'extra ON qual on both sides',
    'SELECT t.sym, t.ts, q.ts AS qts FROM asof_t_g t ASOF LEFT JOIN asof_q_g q
       ON t.sym = q.sym AND t.ts >= q.ts AND t.qty <> q.ts % 13'),
   -- what is on either side of the join
@@ -347,8 +354,10 @@ ORDER BY id;
  ON clause folds to false, LEFT                          | native error: could not identify the match condition of ASOF JOIN                                               | f      |       |         |      
  ON clause folds to false, INNER                         | native error: could not identify the match condition of ASOF JOIN                                               | f      |       |         |      
  ON clause with a nested AND                             | oracle error: ASOF JOIN condition must contain an inequality between a column of "q" and the left side          | f      |       |         |      
- no equality key                                         | native error: native ASOF JOIN requires an equality condition between the joined relations                      | t      |       |         |      
- two equality keys                                       | native error: native ASOF JOIN supports only one equality condition                                             | t      |       |         |      
+ no equality key                                         | ok                                                                                                              | t      |     9 |       0 |     0
+ two equality keys                                       | ok                                                                                                              | t      |  2000 |       0 |     0
+ one left column against two right expressions           | ok                                                                                                              | t      |  2000 |       0 |     0
+ only key turned into a filter by a constant             | ok                                                                                                              | t      |   286 |       0 |     0
  extra ON qual on both sides                             | native error: native ASOF JOIN does not support join conditions other than the equality and the match condition | t      |       |         |      
  right side is a flattened subquery                      | ok                                                                                                              | t      |  2000 |       0 |     0
  right side is a view                                    | ok                                                                                                              | t      |  2000 |       0 |     0
@@ -365,7 +374,7 @@ ORDER BY id;
  ORDER BY ... LIMIT against the join's order             | ok                                                                                                              | t      |    25 |       0 |     0
  in a CTE, used twice                                    | ok                                                                                                              | t      |  1993 |       0 |     0
  in an EXISTS sublink                                    | ok                                                                                                              | t      |     7 |       0 |     0
-(32 rows)
+(34 rows)
 
 --
 -- Inputs that arrive sorted from an index, so the plan has no Sort

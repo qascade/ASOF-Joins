@@ -521,7 +521,7 @@ SELECT * FROM asof_view_left ORDER BY sym, ts;
 (5 rows)
 
 DROP VIEW asof_view_left, asof_view_inner;
--- native executor (#11): >=, LEFT join, one equality key
+-- native executor: >=, LEFT join
 -- (A,5 matches the quote at 5: an exact tie counts for >=)
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts
@@ -583,6 +583,47 @@ $$);
 (13 rows)
 
 DROP FUNCTION asof_explain_analyze(text);
+-- several equality keys, with NULLs in each key and groups on one side only
+CREATE TABLE asof_trades_k (sym text, venue text, ts int);
+CREATE TABLE asof_quotes_k (sym text, venue text, ts int);
+INSERT INTO asof_trades_k VALUES
+  ('A', 'X', 10), ('A', 'X', 20), ('A', 'Y', 15), ('A', NULL, 12),
+  (NULL, 'X', 9), ('B', 'X', 5), ('B', 'Z', 30), ('C', 'X', 40);
+INSERT INTO asof_quotes_k VALUES
+  ('A', 'X', 8), ('A', 'X', 18), ('A', 'X', 18), ('A', 'Y', 16),
+  ('A', NULL, 11), (NULL, 'X', 1), ('B', 'X', 6), ('B', 'Z', 25);
+EXPLAIN (COSTS OFF)
+SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
+  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Asof Left Join
+   Merge Cond: ((t.sym = q.sym) AND (t.venue = q.venue))
+   Asof Cond: (t.ts >= q.ts)
+   ->  Sort
+         Sort Key: t.sym, t.venue, t.ts
+         ->  Seq Scan on asof_trades_k t
+   ->  Sort
+         Sort Key: q.sym, q.venue, q.ts
+         ->  Seq Scan on asof_quotes_k q
+(9 rows)
+
+SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
+  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
+ORDER BY t.sym, t.venue, t.ts;
+ sym | venue | ts | qts 
+-----+-------+----+-----
+ A   | X     | 10 |   8
+ A   | X     | 20 |  18
+ A   | Y     | 15 |    
+ A   |       | 12 |    
+ B   | X     |  5 |    
+ B   | Z     | 30 |  25
+ C   | X     | 40 |    
+     | X     |  9 |    
+(8 rows)
+
+DROP TABLE asof_trades_k, asof_quotes_k;
 -- NULLs on both sides, duplicate match values, keys present on one side only
 CREATE TABLE asof_trades_n (sym text, ts int);
 CREATE TABLE asof_quotes_n (sym text, ts int);
@@ -831,15 +872,6 @@ SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty > 1;
 ERROR:  native ASOF JOIN does not support join conditions other than the equality and the match condition
 DETAIL:  Conditions that use only the right input are allowed.
-HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.ts >= q.ts;
-ERROR:  native ASOF JOIN requires an equality condition between the joined relations
-HINT:  Add a condition such as "left.key = right.key", or set enable_asofjoin_native to off to run the query as a LATERAL join.
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.sym = q.sym AND t.qty = q.price AND t.ts >= q.ts;
-ERROR:  native ASOF JOIN supports only one equality condition
-DETAIL:  The ON clause has 2 equality conditions between the joined relations.
 HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
 -- the planner cannot find the match condition once the ON clause folds to false
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q

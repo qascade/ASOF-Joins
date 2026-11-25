@@ -195,30 +195,16 @@ ExecAsofJoin(PlanState *pstate)
 }
 
 /*
- * The executor handles all four comparison operators and both LEFT and INNER
- * joins, but still only one equality key and no extra ON conditions.
- * Everything else is left to the LATERAL rewrite (enable_asofjoin_native =
- * off).  Raise an error saying which limit this join runs into.
+ * The executor handles all four comparison operators, LEFT and INNER joins
+ * and any number of equality keys, but no extra ON conditions.  Those are
+ * left to the LATERAL rewrite (enable_asofjoin_native = off).
  */
 static void
 asof_check_supported(AsofJoin *node)
 {
-	int			nkeys = list_length(node->mergeclauses);
-
 	Assert(node->join.jointype == JOIN_ASOF_LEFT ||
 		   node->join.jointype == JOIN_ASOF_INNER);
 
-	if (nkeys == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("native ASOF JOIN requires an equality condition between the joined relations"),
-				 errhint("Add a condition such as \"left.key = right.key\", or set enable_asofjoin_native to off to run the query as a LATERAL join.")));
-	if (nkeys > 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("native ASOF JOIN supports only one equality condition"),
-				 errdetail("The ON clause has %d equality conditions between the joined relations.", nkeys),
-				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
 	if (node->join.joinqual != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
