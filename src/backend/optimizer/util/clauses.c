@@ -37,6 +37,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "parser/analyze.h"
@@ -5891,16 +5892,18 @@ make_SAOP_expr(Oid oper, Node *leftexpr, Oid coltype, Oid arraycollid,
 }
 
 /*
- * is_btree_ordering_op
- *		Is opno one of <, <=, >, >= in some btree opfamily?
+ * btree_comparison_kind
+ *		How does some btree opfamily interpret opno?
  *
- * Only such operators can drive an ASOF match, because the inputs are
- * sorted with the same btree opfamily.
+ * Returns COMPARE_LT for any of <, <=, >, >= (only such operators can drive
+ * an ASOF match, because the inputs are sorted with the same btree
+ * opfamily), COMPARE_EQ for =, and COMPARE_INVALID otherwise.
  */
-static bool
-is_btree_ordering_op(Oid opno)
+static CompareType
+btree_comparison_kind(Oid opno)
 {
 	List	   *interps = get_op_index_interpretation(opno);
+	CompareType result = COMPARE_INVALID;
 	ListCell   *lc;
 
 	foreach(lc, interps)
@@ -5911,27 +5914,104 @@ is_btree_ordering_op(Oid opno)
 			continue;
 		if (interp->cmptype == COMPARE_LT || interp->cmptype == COMPARE_LE ||
 			interp->cmptype == COMPARE_GT || interp->cmptype == COMPARE_GE)
-			return true;
+			return COMPARE_LT;
+		if (interp->cmptype == COMPARE_EQ)
+			result = COMPARE_EQ;
 	}
-	return false;
+	return result;
+}
+
+/*
+ * classify_asof_match_clause
+ *		Can this conjunct of an ASOF join's ON clause be its match condition,
+ *		and if not, why not?
+ *
+ * A conjunct qualifies (ASOF_MATCH_OK) when it is a binary btree ordering
+ * comparison (<, <=, >, >=) where one argument references only left-side
+ * relations and the other only right-side relations, neither contains
+ * volatile functions or subqueries, and both argument types can be sorted
+ * in the operator's btree opfamily.  left_relids and right_relids are the
+ * relids (base rels and joins) found within the join's two inputs.
+ *
+ * The other results say what is wrong, so that the parser can explain why
+ * an ON clause has no match condition.  See AsofMatchStatus.
+ */
+AsofMatchStatus
+classify_asof_match_clause(PlannerInfo *root, Node *qual,
+						   Relids left_relids, Relids right_relids)
+{
+	OpExpr	   *op;
+	Relids		lvarnos;
+	Relids		rvarnos;
+	Relids		allvarnos;
+	CompareType kind;
+	bool		l_left,
+				l_right,
+				r_left,
+				r_right;
+	Oid			lefttype;
+	Oid			righttype;
+	Oid			opfamily;
+	CompareType cmptype;
+
+	if (!IsA(qual, OpExpr))
+		return ASOF_MATCH_NOT_COMPARISON;
+	op = (OpExpr *) qual;
+	if (list_length(op->args) != 2)
+		return ASOF_MATCH_NOT_COMPARISON;
+
+	lvarnos = pull_varnos(root, linitial(op->args));
+	rvarnos = pull_varnos(root, lsecond(op->args));
+	allvarnos = bms_union(lvarnos, rvarnos);
+
+	kind = btree_comparison_kind(op->opno);
+	if (kind == COMPARE_EQ)
+		return ASOF_MATCH_EQUALITY;
+	if (kind != COMPARE_LT)
+	{
+		/* only worth reporting if it could have been meant as the match */
+		if (bms_overlap(allvarnos, left_relids) &&
+			bms_overlap(allvarnos, right_relids))
+			return ASOF_MATCH_NOT_ORDERING;
+		return ASOF_MATCH_NOT_COMPARISON;
+	}
+
+	if (contain_subplans(qual))
+		return ASOF_MATCH_SUBQUERY;
+	if (contain_volatile_functions(qual))
+		return ASOF_MATCH_VOLATILE;
+
+	l_left = bms_overlap(lvarnos, left_relids);
+	l_right = bms_overlap(lvarnos, right_relids);
+	r_left = bms_overlap(rvarnos, left_relids);
+	r_right = bms_overlap(rvarnos, right_relids);
+	if ((l_left && l_right) || (r_left && r_right))
+		return ASOF_MATCH_MIXED_OPERAND;
+	if (bms_is_empty(lvarnos) || bms_is_empty(rvarnos) ||
+		!((bms_is_subset(lvarnos, left_relids) &&
+		   bms_is_subset(rvarnos, right_relids)) ||
+		  (bms_is_subset(lvarnos, right_relids) &&
+		   bms_is_subset(rvarnos, left_relids))))
+		return ASOF_MATCH_ONE_SIDED;
+
+	op_input_types(op->opno, &lefttype, &righttype);
+	if (asof_match_opfamilies(op->opno, lefttype, righttype,
+							  &opfamily, &cmptype) == NIL)
+		return ASOF_MATCH_NO_SORT_ORDER;
+
+	return ASOF_MATCH_OK;
 }
 
 /*
  * find_asof_match_clauses
  *		Return the conjuncts of an ASOF join's ON clause that could serve as
- *		its match condition.
+ *		its match condition (see classify_asof_match_clause).
  *
- * "quals" is an implicitly-ANDed list of conjuncts.  left_relids and
- * right_relids are the relids (base rels and joins) found within the
- * join's two inputs.  A conjunct qualifies when it is a binary btree
- * ordering comparison (<, <=, >, >=) where one argument references only
- * right-side relations and the other only left-side relations, and neither
- * contains volatile functions or subqueries.
- *
- * The parser calls this with root = NULL, before planning, to validate the
- * query; the planner calls it again in deconstruct_distribute to pick out
- * the clause.  Callers decide what to do when there is not exactly one.
- * The returned list holds the original conjunct pointers, in order.
+ * "quals" is an implicitly-ANDed list of conjuncts.  The parser calls this
+ * with root = NULL, before planning, to validate the query; the planner
+ * calls it again in deconstruct_distribute to pick out the clause.  Callers
+ * decide what to do when there is not exactly one.  The returned list holds
+ * the original conjunct pointers, in order.
  */
 List *
 find_asof_match_clauses(PlannerInfo *root, List *quals,
@@ -5943,32 +6023,9 @@ find_asof_match_clauses(PlannerInfo *root, List *quals,
 	foreach(lc, quals)
 	{
 		Node	   *qual = (Node *) lfirst(lc);
-		OpExpr	   *op;
-		Relids		lvarnos;
-		Relids		rvarnos;
-		bool		lhs_is_left;
-		bool		lhs_is_right;
 
-		if (!IsA(qual, OpExpr))
-			continue;
-		op = (OpExpr *) qual;
-		if (list_length(op->args) != 2)
-			continue;
-		if (contain_volatile_functions(qual) || contain_subplans(qual))
-			continue;
-		if (!is_btree_ordering_op(op->opno))
-			continue;
-
-		lvarnos = pull_varnos(root, linitial(op->args));
-		rvarnos = pull_varnos(root, lsecond(op->args));
-		if (bms_is_empty(lvarnos) || bms_is_empty(rvarnos))
-			continue;
-
-		lhs_is_left = bms_is_subset(lvarnos, left_relids) &&
-			bms_is_subset(rvarnos, right_relids);
-		lhs_is_right = bms_is_subset(lvarnos, right_relids) &&
-			bms_is_subset(rvarnos, left_relids);
-		if (lhs_is_left || lhs_is_right)
+		if (classify_asof_match_clause(root, qual, left_relids,
+									   right_relids) == ASOF_MATCH_OK)
 			result = lappend(result, qual);
 	}
 

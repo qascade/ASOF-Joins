@@ -139,6 +139,16 @@ SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= q.ts + random()::int;
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
+-- the error says why the closest conjunct is not a match condition
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts + t.qty;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= t.qty;
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.sym ~~ q.sym;
+-- the most specific reason wins, wherever it is in the ON clause
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON q.ts >= 3 AND t.ts <> q.ts AND t.ts >= q.ts + t.qty;
 
 -- native plans: both inputs sorted on the equality keys, then the match column
 EXPLAIN (COSTS OFF)
@@ -227,61 +237,7 @@ SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
 SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
   ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
 ORDER BY t.sym, t.venue, t.ts;
--- same rows as the LATERAL rewrite
-CREATE FUNCTION asof_diff(query text, OUT missing bigint, OUT extra bigint)
-LANGUAGE plpgsql AS
-$$
-BEGIN
-    SET LOCAL enable_asofjoin_native = off;
-    EXECUTE 'CREATE TEMP TABLE asof_ref AS ' || query;
-    SET LOCAL enable_asofjoin_native = on;
-    EXECUTE 'CREATE TEMP TABLE asof_nat AS ' || query;
-    SELECT count(*) INTO missing FROM (TABLE asof_ref EXCEPT ALL TABLE asof_nat) a;
-    SELECT count(*) INTO extra FROM (TABLE asof_nat EXCEPT ALL TABLE asof_ref) b;
-    DROP TABLE asof_ref, asof_nat;
-END;
-$$;
-CREATE TABLE asof_trades_kg AS
-  SELECT (g % 5)::text AS sym, (g % 3)::text AS venue, g AS ts
-  FROM generate_series(1, 2000) g;
-CREATE TABLE asof_quotes_kg AS
-  SELECT (g % 4)::text AS sym, (g % 2)::text AS venue, g * 3 AS ts
-  FROM generate_series(1, 700) g;
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
-  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
-$$);
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
-$$);
--- one left column compared with two right columns
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.sym = q.venue AND t.ts >= q.ts
-$$);
--- expression key
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON (t.ts % 4)::text = q.sym AND t.venue = q.venue AND t.ts >= q.ts
-$$);
--- no equality key
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.ts >= q.ts
-$$);
--- the constant turns the only key into a filter on both inputs
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.ts >= q.ts
-WHERE t.sym = '1'
-$$);
-EXPLAIN (COSTS OFF)
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.ts >= q.ts
-WHERE t.sym = '1';
-DROP FUNCTION asof_diff(text);
-DROP TABLE asof_trades_k, asof_quotes_k, asof_trades_kg, asof_quotes_kg;
+DROP TABLE asof_trades_k, asof_quotes_k;
 
 -- NULLs on both sides, duplicate match values, keys present on one side only
 CREATE TABLE asof_trades_n (sym text, ts int);
@@ -356,13 +312,48 @@ RESET enable_seqscan;
 DROP TABLE asof_ref_n, asof_ref_g, asof_nat_n, asof_nat_g, asof_idx_g;
 DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
 
--- outside #11's scope the executor still refuses to run
-SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
-  ON t.sym = q.sym AND t.ts >= q.ts;
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.sym = q.sym AND t.ts > q.ts;
+-- native executor (#12): all four operators, LEFT and INNER joins
+-- (A,5 and A,10 / B,3 show whether an exact tie counts)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts > q.ts
+ORDER BY t.sym, t.ts;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts <= q.ts
+ORDER BY t.sym, t.ts;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts
+ORDER BY t.sym, t.ts;
+-- match clause written right side first
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON q.sym = t.sym AND q.ts > t.ts
+ORDER BY t.sym, t.ts;
+-- INNER drops trades without a match
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+ORDER BY t.sym, t.ts;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF INNER JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts
+ORDER BY t.sym, t.ts;
+-- a strict WHERE qual on the right side reduces LEFT to INNER
+EXPLAIN (COSTS OFF)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price > 100;
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price > 100
+ORDER BY t.sym, t.ts;
+
+-- (comparisons against the LATERAL rewrite are in asof_join_diff.sql)
+
+-- shapes the native executor does not handle yet; plain EXPLAIN still works
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty > 1;
+-- the planner cannot find the match condition once the ON clause folds to false
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND 1 = 0;
 SET enable_asofjoin_native = off;
 
 -- asof is a keyword now, but still usable as a quoted name or column label

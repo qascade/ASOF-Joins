@@ -273,27 +273,53 @@ ERROR:  ASOF JOIN condition must contain exactly one inequality between the join
 LINE 2:   ON t.ts >= q.ts AND t.qty < q.price;
                               ^
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON q.ts >= 3;
-ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+ERROR:  ASOF JOIN match condition must compare the left input with the right input
 LINE 1: ...T * FROM asof_trades t ASOF JOIN asof_quotes q ON q.ts >= 3;
                                                              ^
+DETAIL:  This comparison does not reference both inputs.
 HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts <> q.ts;
-ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+ERROR:  operator <>(integer,integer) cannot be used as the ASOF JOIN match condition
 LINE 1: ...T * FROM asof_trades t ASOF JOIN asof_quotes q ON t.ts <> q....
                                                              ^
-HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+DETAIL:  The match condition must be a <, <=, > or >= comparison of a btree operator class.
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= q.ts + random()::int;
-ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+ERROR:  ASOF JOIN match condition cannot contain volatile functions
 LINE 2:   ON t.ts >= q.ts + random()::int;
              ^
-HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q.sym);
-ERROR:  ASOF JOIN condition must contain an inequality between the joined relations
+ERROR:  ASOF JOIN match condition cannot contain a subquery
 LINE 2:   ON t.ts >= (SELECT max(ts) FROM asof_quotes WHERE sym = q....
              ^
+-- the error says why the closest conjunct is not a match condition
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts + t.qty;
+ERROR:  each side of the ASOF JOIN match condition must reference only one input
+LINE 2:   ON t.sym = q.sym AND t.ts >= q.ts + t.qty;
+                               ^
+HINT:  Rearrange the comparison so that one side uses only columns of the left input and the other only columns of the right input.
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= t.qty;
+ERROR:  ASOF JOIN match condition must compare the left input with the right input
+LINE 2:   ON t.sym = q.sym AND t.ts >= t.qty;
+                               ^
+DETAIL:  This comparison does not reference both inputs.
 HINT:  Add a condition such as "left.ts >= right.ts" to the ON clause.
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.sym ~~ q.sym;
+ERROR:  operator ~~(text,text) cannot be used as the ASOF JOIN match condition
+LINE 2:   ON t.sym = q.sym AND t.sym ~~ q.sym;
+                               ^
+DETAIL:  The match condition must be a <, <=, > or >= comparison of a btree operator class.
+-- the most specific reason wins, wherever it is in the ON clause
+SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
+  ON q.ts >= 3 AND t.ts <> q.ts AND t.ts >= q.ts + t.qty;
+ERROR:  each side of the ASOF JOIN match condition must reference only one input
+LINE 2:   ON q.ts >= 3 AND t.ts <> q.ts AND t.ts >= q.ts + t.qty;
+                                            ^
+HINT:  Rearrange the comparison so that one side uses only columns of the left input and the other only columns of the right input.
 -- native plans: both inputs sorted on the equality keys, then the match column
 EXPLAIN (COSTS OFF)
 SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
@@ -597,105 +623,7 @@ ORDER BY t.sym, t.venue, t.ts;
      | X     |  9 |    
 (8 rows)
 
--- same rows as the LATERAL rewrite
-CREATE FUNCTION asof_diff(query text, OUT missing bigint, OUT extra bigint)
-LANGUAGE plpgsql AS
-$$
-BEGIN
-    SET LOCAL enable_asofjoin_native = off;
-    EXECUTE 'CREATE TEMP TABLE asof_ref AS ' || query;
-    SET LOCAL enable_asofjoin_native = on;
-    EXECUTE 'CREATE TEMP TABLE asof_nat AS ' || query;
-    SELECT count(*) INTO missing FROM (TABLE asof_ref EXCEPT ALL TABLE asof_nat) a;
-    SELECT count(*) INTO extra FROM (TABLE asof_nat EXCEPT ALL TABLE asof_ref) b;
-    DROP TABLE asof_ref, asof_nat;
-END;
-$$;
-CREATE TABLE asof_trades_kg AS
-  SELECT (g % 5)::text AS sym, (g % 3)::text AS venue, g AS ts
-  FROM generate_series(1, 2000) g;
-CREATE TABLE asof_quotes_kg AS
-  SELECT (g % 4)::text AS sym, (g % 2)::text AS venue, g * 3 AS ts
-  FROM generate_series(1, 700) g;
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_k t ASOF LEFT JOIN asof_quotes_k q
-  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
-$$);
- missing | extra 
----------+-------
-       0 |     0
-(1 row)
-
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.venue = q.venue AND t.ts >= q.ts
-$$);
- missing | extra 
----------+-------
-       0 |     0
-(1 row)
-
--- one left column compared with two right columns
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.sym = q.venue AND t.ts >= q.ts
-$$);
- missing | extra 
----------+-------
-       0 |     0
-(1 row)
-
--- expression key
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON (t.ts % 4)::text = q.sym AND t.venue = q.venue AND t.ts >= q.ts
-$$);
- missing | extra 
----------+-------
-       0 |     0
-(1 row)
-
--- no equality key
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.ts >= q.ts
-$$);
- missing | extra 
----------+-------
-       0 |     0
-(1 row)
-
--- the constant turns the only key into a filter on both inputs
-SELECT * FROM asof_diff($$
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.ts >= q.ts
-WHERE t.sym = '1'
-$$);
- missing | extra 
----------+-------
-       0 |     0
-(1 row)
-
-EXPLAIN (COSTS OFF)
-SELECT t.*, q.ts AS qts FROM asof_trades_kg t ASOF LEFT JOIN asof_quotes_kg q
-  ON t.sym = q.sym AND t.ts >= q.ts
-WHERE t.sym = '1';
-                QUERY PLAN                
-------------------------------------------
- Asof Left Join
-   Asof Cond: (t.ts >= q.ts)
-   ->  Sort
-         Sort Key: t.ts
-         ->  Seq Scan on asof_trades_kg t
-               Filter: (sym = '1'::text)
-   ->  Sort
-         Sort Key: q.ts
-         ->  Seq Scan on asof_quotes_kg q
-               Filter: (sym = '1'::text)
-(10 rows)
-
-DROP FUNCTION asof_diff(text);
-DROP TABLE asof_trades_k, asof_quotes_k, asof_trades_kg, asof_quotes_kg;
+DROP TABLE asof_trades_k, asof_quotes_k;
 -- NULLs on both sides, duplicate match values, keys present on one side only
 CREATE TABLE asof_trades_n (sym text, ts int);
 CREATE TABLE asof_quotes_n (sym text, ts int);
@@ -831,18 +759,125 @@ SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades_g t ASOF LEFT JOIN asof_quotes_
 RESET enable_seqscan;
 DROP TABLE asof_ref_n, asof_ref_g, asof_nat_n, asof_nat_g, asof_idx_g;
 DROP TABLE asof_trades_n, asof_quotes_n, asof_trades_g, asof_quotes_g;
--- outside #11's scope the executor still refuses to run
-SELECT * FROM asof_trades t ASOF JOIN asof_quotes q
-  ON t.sym = q.sym AND t.ts >= q.ts;
-ERROR:  ASOF JOIN executor is not implemented yet
-HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
-SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
-  ON t.sym = q.sym AND t.ts > q.ts;
-ERROR:  ASOF JOIN executor is not implemented yet
-HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
+-- native executor (#12): all four operators, LEFT and INNER joins
+-- (A,5 and A,10 / B,3 show whether an exact tie counts)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts > q.ts
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   1
+ A   | 10 |   8
+ B   |  1 |    
+ B   |  3 |   2
+ C   |  7 |    
+(5 rows)
+
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts <= q.ts
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   5
+ A   | 10 |    
+ B   |  1 |   2
+ B   |  3 |   4
+ C   |  7 |    
+(5 rows)
+
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   8
+ A   | 10 |    
+ B   |  1 |   2
+ B   |  3 |   4
+ C   |  7 |    
+(5 rows)
+
+-- match clause written right side first
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON q.sym = t.sym AND q.ts > t.ts
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   8
+ A   | 10 |    
+ B   |  1 |   2
+ B   |  3 |   4
+ C   |  7 |    
+(5 rows)
+
+-- INNER drops trades without a match
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   5
+ A   | 10 |   8
+ B   |  3 |   2
+(3 rows)
+
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF INNER JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts < q.ts
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   8
+ B   |  1 |   2
+ B   |  3 |   4
+(3 rows)
+
+-- a strict WHERE qual on the right side reduces LEFT to INNER
+EXPLAIN (COSTS OFF)
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price > 100;
+              QUERY PLAN               
+---------------------------------------
+ Asof Join
+   Merge Cond: (t.sym = q.sym)
+   Asof Cond: (t.ts >= q.ts)
+   Filter: (q.price > 100)
+   ->  Sort
+         Sort Key: t.sym, t.ts
+         ->  Seq Scan on asof_trades t
+   ->  Sort
+         Sort Key: q.sym, q.ts
+         ->  Seq Scan on asof_quotes q
+(10 rows)
+
+SELECT t.sym, t.ts, q.ts AS qts FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts
+WHERE q.price > 100
+ORDER BY t.sym, t.ts;
+ sym | ts | qts 
+-----+----+-----
+ A   |  5 |   5
+ A   | 10 |   8
+ B   |  3 |   2
+(3 rows)
+
+-- (comparisons against the LATERAL rewrite are in asof_join_diff.sql)
+-- shapes the native executor does not handle yet; plain EXPLAIN still works
 SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
   ON t.sym = q.sym AND t.ts >= q.ts AND t.qty + q.price > 100;
-ERROR:  ASOF JOIN executor is not implemented yet
+ERROR:  native ASOF JOIN does not support join conditions other than the equality and the match condition
+DETAIL:  Conditions that use only the right input are allowed.
+HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND t.qty > 1;
+ERROR:  native ASOF JOIN does not support join conditions other than the equality and the match condition
+DETAIL:  Conditions that use only the right input are allowed.
+HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
+-- the planner cannot find the match condition once the ON clause folds to false
+SELECT * FROM asof_trades t ASOF LEFT JOIN asof_quotes q
+  ON t.sym = q.sym AND t.ts >= q.ts AND 1 = 0;
+ERROR:  could not identify the match condition of ASOF JOIN
+DETAIL:  Simplifying the query changed the ON clause, for example by folding it to a constant or by replacing a column with a constant from a subquery.
 HINT:  Set enable_asofjoin_native to off to run the query as a LATERAL join.
 SET enable_asofjoin_native = off;
 -- asof is a keyword now, but still usable as a quoted name or column label

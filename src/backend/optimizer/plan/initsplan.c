@@ -1616,6 +1616,7 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("could not identify the match condition of ASOF JOIN"),
+						 errdetail("Simplifying the query changed the ON clause, for example by folding it to a constant or by replacing a column with a constant from a subquery."),
 						 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
 			match = (Expr *) linitial(matches);
 

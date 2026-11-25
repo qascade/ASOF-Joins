@@ -103,10 +103,17 @@ asof_clear_best(AsofJoinState *node)
 /*
  * ExecAsofJoin
  *
- * Both inputs arrive sorted by (equality keys, match column) ascending.
+ * Both inputs arrive sorted by the equality keys, then by the match column:
+ * ascending for > and >=, descending for < and <=.  Either way the rows that
+ * satisfy the match condition for an outer row come first in its key group,
+ * and the nearest of them is the last one, so the same forward scan serves
+ * all four operators.  Whether an exact tie counts (>= and <=) or not (> and
+ * <) is decided by the match condition itself.
+ *
  * Each call returns one output row: the next outer row, joined to the latest
- * inner row with the same keys that satisfies the match condition, or to
- * NULLs if there is none.  The inner cursor only ever moves forward.
+ * qualifying inner row with the same keys.  With none, a LEFT join pairs the
+ * outer row with NULLs and an INNER join drops it.  The inner cursor only
+ * ever moves forward.
  */
 static TupleTableSlot *
 ExecAsofJoin(PlanState *pstate)
@@ -170,6 +177,10 @@ ExecAsofJoin(PlanState *pstate)
 				matchslot = node->aj_BestSlot;
 		}
 
+		/* INNER join: an outer row with no match produces nothing */
+		if (matchslot == NULL && node->js.jointype == JOIN_ASOF_INNER)
+			continue;
+
 		/* build the output row: outer + best, or outer + NULLs */
 		econtext->ecxt_outertuple = outerslot;
 		econtext->ecxt_innertuple = matchslot ? matchslot
@@ -184,18 +195,22 @@ ExecAsofJoin(PlanState *pstate)
 }
 
 /*
- * Only >=, LEFT join and no extra ON conditions for now, with any number of
- * equality keys.  Everything else is left to the LATERAL rewrite
- * (enable_asofjoin_native = off).
+ * The executor handles all four comparison operators, LEFT and INNER joins
+ * and any number of equality keys, but no extra ON conditions.  Those are
+ * left to the LATERAL rewrite (enable_asofjoin_native = off).
  */
-
-static bool
-asof_is_supported(AsofJoin *node)
+static void
+asof_check_supported(AsofJoin *node)
 {
-	return node->join.jointype == JOIN_ASOF_LEFT &&
-		!node->asof_descending &&
-		!node->asof_strict &&
-		node->join.joinqual == NIL;
+	Assert(node->join.jointype == JOIN_ASOF_LEFT ||
+		   node->join.jointype == JOIN_ASOF_INNER);
+
+	if (node->join.joinqual != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("native ASOF JOIN does not support join conditions other than the equality and the match condition"),
+				 errdetail("Conditions that use only the right input are allowed."),
+				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
 }
 
 /*
@@ -273,11 +288,8 @@ ExecInitAsofJoin(AsofJoin *node, EState *estate, int eflags)
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
 
 	/* Outside the narrow case: plain EXPLAIN is fine, running is not */
-	if (!asof_is_supported(node) && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("ASOF JOIN executor is not implemented yet"),
-				 errhint("Set enable_asofjoin_native to off to run the query as a LATERAL join.")));
+	if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		asof_check_supported(node);
 
 	asofstate = makeNode(AsofJoinState);
 	asofstate->js.ps.plan = (Plan *) node;
@@ -310,7 +322,7 @@ ExecInitAsofJoin(AsofJoin *node, EState *estate, int eflags)
 	asofstate->js.joinqual =
 		ExecInitQual(node->join.joinqual, (PlanState *) asofstate);
 
-	/* the match condition, t.ts >= q.ts */
+	/* the match condition, e.g. t.ts >= q.ts */
 	asofstate->aj_AsofCond =
 		ExecInitQual(list_make1(node->asofclause), (PlanState *) asofstate);
 

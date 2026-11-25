@@ -145,6 +145,33 @@ extern bool contain_volatile_functions(Node *clause);
 extern bool contain_volatile_functions_after_planning(Expr *expr);
 extern bool contain_volatile_functions_not_nextval(Node *clause);
 
+/*
+ * Why a conjunct of an ASOF join's ON clause can or cannot be its match
+ * condition (classify_asof_match_clause).  The values after
+ * ASOF_MATCH_EQUALITY are ordered from least to most specific: when an ON
+ * clause has no match condition, the parser reports the conjunct with the
+ * highest one.
+ */
+typedef enum AsofMatchStatus
+{
+	ASOF_MATCH_OK,				/* usable as the match condition */
+	ASOF_MATCH_NOT_COMPARISON,	/* not a binary operator, or one that is
+								 * neither an ordering nor across the join */
+	ASOF_MATCH_EQUALITY,		/* an equality: a join key, not a match */
+	ASOF_MATCH_ONE_SIDED,		/* does not compare the left input with the
+								 * right input */
+	ASOF_MATCH_NOT_ORDERING,	/* across the join, but not <, <=, >, >= */
+	ASOF_MATCH_NO_SORT_ORDER,	/* an argument type cannot be sorted in the
+								 * operator's btree opfamily */
+	ASOF_MATCH_VOLATILE,		/* contains volatile functions */
+	ASOF_MATCH_SUBQUERY,		/* contains a subquery */
+	ASOF_MATCH_MIXED_OPERAND,	/* an argument references both inputs */
+} AsofMatchStatus;
+
+extern AsofMatchStatus classify_asof_match_clause(PlannerInfo *root,
+												  Node *qual,
+												  Bitmapset *left_relids,
+												  Bitmapset *right_relids);
 extern List *find_asof_match_clauses(PlannerInfo *root, List *quals,
 									 Bitmapset *left_relids,
 									 Bitmapset *right_relids);
