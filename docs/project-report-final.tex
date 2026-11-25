@@ -56,21 +56,22 @@
   \large CS631 Course Project Report}
 \author{Deepjyoti Kakoti (26M0774) \and Debasish Bordoloi (26M0776) \and
   Shubh Karman Singh (26M0843)}
-\date{November 2026}
+\date{November 2026\\[8pt]
+  \normalsize Code and git history: \url{https://github.com/qascade/ASOF-Joins}}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-An \emph{ASOF join} pairs each row of one table with the single nearest row of another
-table in time, for example each trade with the latest quote that was valid when the trade
-happened. Many analytical databases support it, but PostgreSQL does not. We added
+An \emph{ASOF join} matches each row of one table with at most one row of another
+table: the row whose time is closest to it, looking either backwards or forwards in
+time, as the join condition says. For example, it matches each trade with the latest quote
+that was valid when the trade happened. Many analytical databases support it, such as
+DuckDB, ClickHouse, Snowflake, kdb+ and QuestDB, but PostgreSQL does not. We added
 \code{ASOF JOIN} to PostgreSQL~18 in two phases. In the first phase the new syntax is
-rewritten into an equivalent query that PostgreSQL can already run. In the second phase
-ASOF becomes a real join type: the optimizer plans it as a sort followed by a single
-merge pass, and a new executor operator runs it. A setting switches between the two
-versions, and a test suite of about 90 queries checks that both always return the same
-rows.
+rewritten into an equivalent lateral join query that PostgreSQL can already run. In the
+second phase ASOF becomes a real join type: the optimizer plans it as a sort followed by
+a single merge pass, and a new executor operator runs it.
 \end{abstract}
 
 \tableofcontents
@@ -109,10 +110,11 @@ comes later.
 An ordinary join cannot express this. The join
 $\texttt{t.sym = q.sym AND t.ts >= q.ts}$ returns \emph{every} earlier quote: two rows for
 trade \code{(A,5)} and three for \code{(A,9)}. The ASOF join keeps only the nearest one.
-In relational terms it is a join followed by an ``arg-max per left row'', which is not
-something a filter can do.
+A filter cannot do this, because a filter looks at one joined row at a time, while
+choosing the nearest quote needs all the candidate quotes of a trade to be compared.
 
 \subsection{How people write it in PostgreSQL today}
+\label{sec:lateral}
 
 Without ASOF support, users write a \emph{LATERAL} subquery, which runs once for each
 trade:
@@ -127,9 +129,10 @@ LEFT JOIN LATERAL (
     LIMIT 1) q ON true;
 \end{lstlisting}
 
-This query is long and easy to get wrong. It is also slow unless there is an index on
-\code{quotes(sym, ts)}: without one, every trade scans the whole \code{quotes} table, so
-the work grows as $n \times m$ for $n$ trades and $m$ quotes.
+This query is slow when there is no index on \code{quotes(sym, ts)}. Without such an
+index, the subquery scans the whole \code{quotes} table once for every trade, so the work
+grows as $n \times m$ for $n$ trades and $m$ quotes. With the index, each trade needs one
+index lookup instead.
 
 \subsection{What we built}
 
@@ -141,14 +144,11 @@ FROM trades t ASOF LEFT JOIN quotes q
   ON t.sym = q.sym AND t.ts >= q.ts;
 \end{lstlisting}
 
-Other systems that support ASOF joins include DuckDB, ClickHouse, Snowflake, kdb+ and
-QuestDB.
-
 %=====================================================================
 \section{The syntax and its meaning}
 %=====================================================================
 
-\subsection{Accepted spellings}
+\subsection{Accepted grammar}
 
 \begin{itemize}
   \item \code{a ASOF JOIN b ON ...} and \code{a INNER ASOF JOIN b ON ...}: inner ASOF join.
@@ -165,7 +165,7 @@ called \code{asof} must now be written in quotes.
 \subsection{The rules}
 
 The \code{ON} clause is a list of conditions joined by \code{AND}. It must contain
-\textbf{exactly one} comparison with \code{<}, \code{<=}, \code{>} or \code{>=} between a
+\textbf{exactly one} ASOF comparison with \code{<}, \code{<=}, \code{>} or \code{>=} between a
 left-side expression and a right-side expression. We call it the \emph{match condition}.
 The other conditions are usually equalities such as \code{t.sym = q.sym}, which we call
 the \emph{keys}.
@@ -229,7 +229,7 @@ We worked in two phases:
         the LATERAL query shown above. Nothing after the analyzer changes. This gave us
         correct results quickly, and a reference to test against later.
   \item \textbf{Phase 2: native join.} Make ASOF a real join type that the planner
-        understands, plan it as ``sort both inputs, then merge them in one pass'', and
+        understands, plan it as ``sort both the inputs, then merge them in one pass'', and
         write a new executor operator for it.
 \end{enumerate}
 
@@ -240,7 +240,7 @@ SET enable_asofjoin_native = on;   -- default: the native join (Phase 2)
 SET enable_asofjoin_native = off;  -- the LATERAL rewrite (Phase 1)
 \end{lstlisting}
 
-This lets us compare the two for correctness and speed, and gives users a fallback for
+This lets us compare the results of the two, and gives users a fallback for
 queries that the native join cannot run yet.
 
 %=====================================================================
@@ -249,7 +249,7 @@ queries that the native join cannot run yet.
 
 \subsection{How it works}
 
-The grammar was extended to accept the spellings above and to mark the join as ASOF. At
+The grammar was extended to accept the forms above and to mark the join as ASOF. At
 the very start of the analyzer, before any names are resolved, the ASOF join is rewritten
 into a lateral subquery:
 
@@ -264,24 +264,20 @@ into a lateral subquery:
 \end{itemize}
 
 Because the rewrite happens so early, everything afterwards is unchanged PostgreSQL code.
-
-\subsection{Result}
-
-The rewritten query and a hand-written LATERAL query produce the \emph{same} plan, so
-they run in the same time. Five runs of a 50,000 trades $\times$ 200,000 quotes query with
-an index gave a median of 1924\,ms for \code{ASOF JOIN} and 1904\,ms for the hand-written
-form. The 1\% gap is noise: each query alone varied by about 12\% between runs.
+The rewritten query and a hand-written LATERAL query produce the same plan.
 
 \subsection{Limitations of the rewrite}
 
 \begin{itemize}
   \item Since the rewrite runs before names are resolved, it has to recognise the two
         sides of the match condition by matching column names as text.
-  \item The right side must be a table or a named subquery.
+  \item The right-side operand of the match condition must be a plain column such as
+        \code{q.ts}, not an expression such as \code{q.ts * 2}.
+  \item The right side of the join must be a table or a named subquery.
   \item A view stores the rewritten query, so showing the view's definition prints a
         LATERAL subquery instead of \code{ASOF JOIN}.
   \item Most importantly, it is \emph{only as fast as the LATERAL query}: very slow
-        without an index (Section~\ref{sec:bench}).
+        without an index (Section~\ref{sec:lateral}).
 \end{itemize}
 
 %=====================================================================
@@ -290,11 +286,12 @@ form. The 1\% gap is noise: each query alone varied by about 12\% between runs.
 
 \subsection{The idea: sort, then one merge pass}
 
-If both tables are sorted by \code{(sym, ts)}, the ASOF join can be done in one pass, like
-a sort-merge join. Keep a ``finger'' on the quotes table. For each trade, move the finger
-forward over quotes with the same symbol and a time at or before the trade's time; the
-last quote passed is the answer. Because the trades are also sorted, the next trade never
-needs a quote that is behind the finger, so the finger \emph{never moves backwards}.
+If both the tables are sorted by \code{(sym, ts)}, the ASOF join can be done in one pass,
+like a sort-merge join. We keep an iterator on the quotes table. For each trade, the
+iterator moves forward over the quotes that have the same symbol and a time at or before
+the trade's time. The last quote it passed is the answer for that trade. Because the
+trades are also sorted, the next trade never needs a quote that is behind the iterator,
+so the iterator will never move backwards.
 
 After sorting, this costs $O(n + m)$, compared with $O(n \times m)$ for the LATERAL query
 without an index. Sorting costs $O(n \log n + m \log m)$, and is skipped when an index
@@ -319,9 +316,10 @@ condition, so they can never disagree.
 
 \subsection{Planner changes}
 
-The planner is where most of the work is. Its normal job is to decide where each
-condition should be checked, in what order to join the tables, and which join algorithm
-to use. An ASOF join breaks several of its usual assumptions, so each needed care.
+Most of the Phase 2 work is in the planner. The planner decides where each condition
+should be checked, in what order to join the tables, and which join algorithm to use. An
+ASOF join does not follow several of the planner's usual assumptions. The points below
+describe each one and what we changed.
 
 \paragraph{1. The match condition is not an ordinary condition.}
 Normally the planner collects all conditions into one pool and lets any join algorithm
@@ -365,8 +363,8 @@ know about the match condition.
 
 \paragraph{6. Choosing the sort order.}
 Both inputs are sorted first on the keys and then on the time column, for example
-\code{(t.sym, t.ts)} and \code{(q.sym, q.ts)}. The clever part is the sort
-\emph{direction}, which lets one forward-only scan handle all four operators:
+\code{(t.sym, t.ts)} and \code{(q.sym, q.ts)}. The sort direction of the time column
+depends on the operator, so that one forward-only scan can handle all four operators:
 
 \begin{center}
 \begin{tabular}{@{}lll@{}}
@@ -379,11 +377,12 @@ Match condition & Nearest means & Sort time column \\
 \end{tabular}
 \end{center}
 
-In both cases, while scanning forward the qualifying rows come first and the nearest one
-is the \emph{last} qualifying row. The executor only needs two flags: whether the sort is
-descending, and whether the comparison is strict. If the user wrote the condition the
-other way round, for example \code{q.ts <= t.ts}, the planner flips it so the left table
-is always on the left. NULLs are sorted last, since they never match.
+In both cases, while scanning forward, the qualifying rows come first and the nearest one
+is the \emph{last} qualifying row. So the executor does not need to know which operator
+was used. It only checks whether the match condition is true for each row, and the
+condition itself decides whether an exact tie counts. If the user wrote the condition the
+other way round, for example \code{q.ts <= t.ts}, the planner flips it so the left
+table's column is always on the left. NULLs are sorted last, since they never match.
 
 \paragraph{7. Skipping unnecessary sorts.}
 If an input is already in the needed order, for example because it is read through an
@@ -398,8 +397,8 @@ The planner compares plans by estimated cost. For the ASOF join path the cost is
    + c_{\text{cmp}} \cdot (n + m) + c_{\text{filter}} \cdot n
    + c_{\text{out}} \cdot \text{rows out},
 \]
-where each sort is counted only when it is needed. This is the textbook sort-merge
-formula.
+where each sort is counted only when it is needed. This is the same shape as the cost
+of a sort-merge join.
 
 \paragraph{9. Row count estimate.}
 A left ASOF join returns exactly one row per left row, so the estimate is $n$ (reduced by
@@ -419,7 +418,7 @@ sorted inputs (Figure~\ref{fig:plan}).
 \begin{figure}[h]
 \centering
 \begin{lstlisting}[style=plain]
-Asof Left Join
+Asof Join
   Merge Cond: (t.sym = q.sym)
   Asof Cond: (t.ts >= q.ts)
   Filter: (q.price > 10)
@@ -430,19 +429,23 @@ Asof Left Join
         Sort Key: q.sym, q.ts
         ->  Seq Scan on quotes q
 \end{lstlisting}
-\caption{The plan PostgreSQL shows for a native ASOF join (\code{EXPLAIN}).}
+\caption{The \code{EXPLAIN} output for \code{trades t ASOF LEFT JOIN quotes q ON t.sym =
+q.sym AND t.ts >= q.ts WHERE q.price > 10}. The node says \code{Asof Join}, not
+\code{Asof Left Join}, because the \code{WHERE} condition turned the left join into an
+inner one (planner point~4).}
 \label{fig:plan}
 \end{figure}
 
 \subsubsection{The algorithm}
 
-The operator keeps an \emph{inner cursor} (the next unread quote) and a \emph{best} row
-(the nearest quote found so far for the current key). For each outer row (trade):
+The operator keeps an \emph{iterator} on the inner input (it points at the next unread
+quote) and a \emph{best} row (the nearest quote found so far for the current key). For
+each outer row (trade):
 
 \begin{enumerate}
   \item If the trade's key is NULL, it has no match.
   \item If \emph{best} belongs to a different key than this trade, forget it.
-  \item Move the cursor forward:
+  \item Move the iterator forward:
     \begin{itemize}
       \item while the quote's key is \emph{smaller} than the trade's key, skip it: no
             later trade can want it;
@@ -457,51 +460,25 @@ The operator keeps an \emph{inner cursor} (the next unread quote) and a \emph{be
   \item Apply any \code{WHERE} filters to the output row.
 \end{enumerate}
 
-\subsubsection{Worked example}
-
-With the tables from Section~1, sorted, and the condition \code{t.ts >= q.ts}:
-
-\begin{center}
-\begin{tabular}{@{}lp{8.5cm}l@{}}
-\toprule
-Trade & What the cursor does & Output \\
-\midrule
-\code{(A,5)} & \code{(A,2)} qualifies $\to$ best. \code{(A,4)} qualifies $\to$ best.
-               \code{(A,7)} is too late, stop. & \code{(A,5)} + \code{(A,4)} \\
-\code{(A,9)} & Best \code{(A,4)} is the same key, keep it. \code{(A,7)} qualifies $\to$
-               best. \code{(B,6)} has a later key, stop. & \code{(A,9)} + \code{(A,7)} \\
-\code{(B,3)} & Best \code{(A,7)} is a different key, forget it. \code{(B,6)} is too late,
-               stop. No best. & \code{(B,3)} + NULLs \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Every quote is visited once, and the cursor never moves back.
-
 \subsubsection{Why it is correct}
 
 Within one key, trades come in increasing time. Any quote that is early enough for one
 trade is also early enough for every later trade with the same key. So the quotes the
-cursor has passed never need to be seen again, and the last one passed is the nearest.
-For \code{<} and \code{<=} the same argument holds with both sides sorted descending.
+iterator has passed never need to be seen again, and the last one passed is the nearest.
+For \code{<} and \code{<=} the same argument holds with both the sides sorted descending.
 
 The re-check in step~4 handles one special case: a trade with a NULL time. \emph{Best}
 may still hold a quote from the previous trade, and the re-check makes sure that quote is
 not returned.
 
-\subsubsection{Two implementation details}
+\subsubsection{Keeping the best row}
 
-\begin{itemize}
-  \item \textbf{Copy, not pointer.} The best row is \emph{copied} into memory owned by
-        the operator. The input operator reuses the same memory for every row it
-        returns, so keeping only a pointer would silently change the answer when the
-        cursor moves on.
-  \item \textbf{Same comparison as the sort.} Keys are compared using exactly the rules
-        the Sort used (comparison function, text collation, direction, NULL position).
-        If the two disagreed, the merge would walk past rows it should have stopped at.
-\end{itemize}
+The best row is \emph{copied} into memory owned by the operator. The input operator
+reuses the same memory for every row it returns. If we kept only a pointer to the best
+row, its values would change as soon as the iterator moved to the next quote.
 
 \subsubsection{What the operator does not handle yet}
+\label{sec:executor-limits}
 
 The native operator currently needs \textbf{exactly one} equality key, and supports no
 \code{ON} conditions other than the key and the match condition (conditions on the right
@@ -535,8 +512,8 @@ This section says \emph{where} each part of the work lives in the PostgreSQL sou
 code and \emph{what} was changed there. PostgreSQL's C code is in \src{src/backend}, and
 its header files, which define the shared data structures, are in \src{src/include}.
 Below, paths starting with \src{backend/} or \src{include/} are relative to \src{src/}.
-In total the project changed or added 42 files under \src{src/}, about 4,100 lines
-including tests.
+In total the project changed or added 36 files under \src{src/}, about 2,100 lines,
+not counting test files.
 
 \begin{table}[h]
 \centering
@@ -558,8 +535,6 @@ Executor & \src{backend/executor/nodeAsofjoin.c} (new), \src{execProcnode.c} \\
 Display & \src{backend/commands/explain.c}, \src{backend/utils/adt/ruleutils.c} \\
 Data structures & \src{include/nodes/nodes.h}, \src{pathnodes.h}, \src{plannodes.h},
                   \src{execnodes.h} \\
-Tests & \src{test/regress/sql/asof_join.sql}, \src{asof_join_diff.sql} and their
-        expected outputs \\
 \bottomrule
 \end{tabular}
 \caption{Where each stage of the work lives.}
@@ -607,7 +582,7 @@ Tests & \src{test/regress/sql/asof_join.sql}, \src{asof_join_diff.sql} and their
 
   \fileitem{\src{test.sql}} (at the top of the repository)
     A self-checking script that runs each ASOF query next to a hand-written LATERAL
-    query and prints \code{PASS} or \code{FAIL}, plus timings on larger data.
+    query and prints \code{PASS} or \code{FAIL}.
 
 \subsection{Phase 2: the switch and the new join types}
 
@@ -786,16 +761,6 @@ Tests & \src{test/regress/sql/asof_join.sql}, \src{asof_join_diff.sql} and their
     numbers never change. Adding new node types shifts them, so that check was turned
     off for this development tree.
 
-  \fileitem{Tests and benchmarks}
-    \src{test/regress/sql/asof_join.sql} and \src{asof_join_diff.sql} hold the test
-    queries; their stored outputs are in \src{test/regress/expected/}. Both are listed
-    in \src{test/regress/parallel_schedule} so that \code{make check} runs them.
-    \src{test/regress/expected/sysviews.out} changed only because the new setting now
-    appears in the list of settings. The \src{bench/} folder at the top of the
-    repository holds the data generator (\src{gen_data.sql}), the index script, the
-    timed queries and \src{run.sh}, which runs everything. The continuous-integration
-    job is \src{.github/workflows/ci.yml}.
-
 \end{sloppypar}
 
 %=====================================================================
@@ -832,30 +797,11 @@ equality key, more than one, or an extra \code{ON} condition) and a hint to turn
 \section{Testing}
 %=====================================================================
 
-\subsection{Regression tests}
-
-PostgreSQL has a regression test suite in which every test file has a stored expected
-output. We added \code{asof\_join} with tests for:
-
-\begin{itemize}
-  \item the grammar, including \code{asof} still working as a column label and as a
-        quoted name;
-  \item all four operators, inner and left, with exact ties in time;
-  \item NULLs on both sides, duplicate times, keys present on one side only, and empty
-        tables;
-  \item every error message;
-  \item the plans shown by \code{EXPLAIN}, including skipped sorts when an index exists;
-  \item view definitions and \code{EXPLAIN ANALYZE} counts.
-\end{itemize}
-
-The full suite passes, and a continuous-integration job builds PostgreSQL and runs it on
-every change.
-
 \subsection{Comparing the two phases}
 
-The strongest test is a \emph{differential} one. Each of about 90 queries is run twice,
-once with the switch off (the LATERAL rewrite, which we trust) and once with it on (the
-native join). The two results are compared row by row in both directions. The test also
+The main correctness test is a \emph{differential} one. Each of 83 queries is run twice,
+once with the switch off (the LATERAL rewrite, which is simple enough to use as the
+reference) and once with it on (the native join). The two results are compared row by row in both directions. The test also
 checks that the native plan really contains an ASOF join node, so a query that silently
 fell back to another plan cannot pass.
 
@@ -865,39 +811,11 @@ either side; subqueries, views and aggregates as inputs; other joins above and b
 ASOF join; two ASOF joins in a row; \code{ORDER BY ... LIMIT}; \code{WITH} queries;
 prepared statements; inputs sorted by an index; and sorts large enough to spill to disk.
 
-\textbf{Result: no wrong answers.} Every query that runs on both paths returns identical
-rows. The test also found three valid queries that the native planner rejects (see
+\textbf{Result: no wrong answers.} 74 of the 83 queries run on both paths, and each of them
+returns identical rows on both. The other 9 stop with an error on one path: 4 are outside
+the native operator's limits (Section~\ref{sec:executor-limits}), 2 are queries the
+LATERAL rewrite cannot run, and 3 are valid queries that the native planner rejects (see
 Section~\ref{sec:limits}).
-
-%=====================================================================
-\section{Performance}
-\label{sec:bench}
-%=====================================================================
-
-We first measured the hand-written LATERAL query, which is exactly what Phase~1 runs, on
-generated data with about 50 symbols. The tables are the same on every machine. Times are
-the median of three warm runs on an optimised build, with a 600-second limit.
-
-\begin{center}
-\begin{tabular}{@{}lrr@{}}
-\toprule
-Rows per table & Without index & With index on \code{(sym, ts)} \\
-\midrule
-$10^5$ & 411.5 s & 0.69 s \\
-$10^6$ & more than 600 s & 6.99 s \\
-$10^7$ & more than 600 s & 137.0 s \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Without an index, the time for each trade grows ten times for every ten times more
-quotes, because each trade scans all the quotes. With an index each trade does one index
-lookup, which is much better but still one random lookup per trade.
-
-The native join replaces this with two sorts and one pass, $O(n \log n + m \log m)$, or
-just $O(n + m)$ when indexes already give the order. It should therefore win most clearly
-when there is no index. The full timing comparison of the native join against these
-numbers has not been run yet and is the next step.
 
 %=====================================================================
 \section{Limitations and future work}
@@ -922,7 +840,6 @@ numbers has not been run yet and is the next step.
         condition, so it is too high when many left rows come before all right rows.
   \item \textbf{Parallel and partitioned execution} are not supported.
   \item \textbf{RIGHT and FULL ASOF joins} are not supported.
-  \item \textbf{Benchmarks} of the native join against the baseline above.
 \end{itemize}
 
 %=====================================================================
@@ -932,17 +849,33 @@ numbers has not been run yet and is the next step.
 We added \code{ASOF JOIN} to PostgreSQL~18 in two steps. The first step, a rewrite into a
 LATERAL query, gave correct results with very little code and became the reference for
 testing. The second step made ASOF a real join type with its own planning and its own
-executor operator. The operator sorts both inputs once and walks them together, so it
-does not depend on an index the way the LATERAL query does.
+executor operator. The operator sorts both the inputs once and reads them together in
+one pass, so it does not depend on an index the way the LATERAL query does.
 
-The main lesson of the second step is that the match condition looks like an ordinary
-join condition but does not behave like one. Most of the planner work was about keeping
-the optimizer's usual tools away from it: taking it out of the condition pool, keeping
-filters above the join, fixing the join order, and allowing only one join algorithm. A
-choice of sort direction then lets a single forward-only scan handle all four comparison
-operators.
+In the second step, the match condition looks like an ordinary join condition, but the
+planner must not treat it like one. Most of the planner work was therefore about keeping
+the planner's usual steps away from it: taking it out of the shared pool of conditions,
+keeping filters above the join, fixing the join order, and allowing only one join
+algorithm. The sort direction of the time column is chosen from the operator, so one
+forward-only scan handles all four comparison operators.
 
-A switch keeps both versions available, and a differential test of about 90 queries
-shows that they always agree.
+A setting keeps both versions available. A differential test of 83 queries finds no
+query on which the two versions return different rows.
+
+%=====================================================================
+\section*{AI usage statement}
+\addcontentsline{toc}{section}{AI usage statement}
+%=====================================================================
+
+We used an AI assistant (Claude, through Claude Code) during this project for the
+following tasks:
+
+\begin{itemize}
+  \item understanding the structure of the PostgreSQL code and what its various
+        functions do;
+  \item finding the files that we needed to change for our use case;
+  \item regression testing and creating test cases;
+  \item managing our GitHub issues.
+\end{itemize}
 
 \end{document}
