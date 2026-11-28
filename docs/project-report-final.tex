@@ -314,6 +314,15 @@ When the switch is on, the analyzer no longer rewrites the query. Instead it:
 The analyzer and the planner use the \emph{same} function to decide what counts as a match
 condition, so they can never disagree.
 
+\textbf{Hack.} Both new join types, \code{ASOF\_INNER} included, are added to
+PostgreSQL's \src{IS_OUTER_JOIN} test. An inner ASOF join is not an outer join, but it
+shares the property that matters: its \code{ON} conditions decide which rows match,
+while \code{WHERE} conditions only filter the result, so the two must not be mixed.
+Code that passes this test already keeps them apart: it picks sort keys only from the
+\code{ON} conditions, estimates their selectivity separately, and puts them in a
+different list in the plan (\code{Join Filter} versus \code{Filter}). ASOF joins get all
+of this without our having to change each of those places one by one.
+
 \subsection{Planner changes}
 
 Most of the Phase 2 work is in the planner. The planner decides where each condition
@@ -327,6 +336,11 @@ apply them as filters. If \code{t.ts >= q.ts} went into that pool, a hash join o
 loop join would apply it as a filter and return \emph{every} earlier quote, which is
 wrong. So the planner takes the match condition \emph{out} of the pool and stores it
 privately with the ASOF join. Only the ASOF-specific code ever reads it.
+
+\textbf{Hack.} The private place is a new field, \src{asof_clause}, added to
+\src{SpecialJoinInfo}, the record the planner already keeps for each non-inner join.
+The condition never enters the planner's normal lists of join conditions, so no other
+part of the planner can see it, and none of them had to be changed to skip it.
 
 The planner checks again that there is exactly one match condition, because simplifying
 the query can change the \code{ON} clause after the analyzer has checked it.
@@ -349,6 +363,11 @@ refuses such a push-down for the right side of a left outer join, because that s
 be filled with NULLs. It does this by marking the right side's columns as ``possibly NULL
 after this join''. We mark the right side of \emph{every} ASOF join this way, inner joins
 included, so that filters stay above the join.
+
+\textbf{Hack.} The marking is stored in each column reference's \src{varnullingrels}.
+For an inner ASOF join it is not true: the right side is never filled with NULLs. We
+set it anyway, because it is the existing mechanism that stops the planner from pushing
+filters down, so no new mechanism was needed.
 
 \paragraph{4. A left ASOF join can become an inner one.}
 If a \code{WHERE} condition on the right side rejects NULLs (for example
